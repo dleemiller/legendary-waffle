@@ -36,11 +36,14 @@ def normalize_coordinates(
     normalized = []
     for point in data_points:
         # x and y are already normalized to [0,1] in the dataset
-        # We just keep them as-is (they're already relative to canvas)
+        # But sometimes they go slightly outside bounds, so clamp them
+        x_norm = max(0.0, min(1.0, point["x"]))
+        y_norm = max(0.0, min(1.0, point["y"]))
+
         # Normalize timestamp to [0, 1]
         t_norm = (point["t"] - t_min) / t_range
 
-        normalized.append({"x": point["x"], "y": point["y"], "t": t_norm})
+        normalized.append({"x": x_norm, "y": y_norm, "t": t_norm})
 
     return normalized
 

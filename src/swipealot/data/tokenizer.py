@@ -63,12 +63,15 @@ class CharacterTokenizer:
         return [self.char_to_id.get(char, unk_id) for char in text.lower()]
 
     def decode(self, token_ids: list[int]) -> str:
-        """Decode token IDs to text."""
+        """Decode token IDs to text, stopping at EOS token."""
         chars = []
         for token_id in token_ids:
             if token_id in self.id_to_char:
                 char = self.id_to_char[token_id]
-                # Skip special tokens except for debugging
+                # Stop at EOS token
+                if char == self.eos_token:
+                    break
+                # Skip other special tokens except for debugging
                 if char not in self.special_tokens or char == " ":
                     chars.append(char)
         return "".join(chars)

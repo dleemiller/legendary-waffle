@@ -39,7 +39,7 @@ class SwipeTrainer:
             optimizer: Optimizer
             loss_fn: Loss function
             device: Device to train on
-            config: Training configuration
+            config: Full Config object (or TrainingConfig for backward compatibility)
             tokenizer: Character tokenizer (optional, for word accuracy)
             scheduler: Learning rate scheduler (optional)
         """
@@ -53,6 +53,14 @@ class SwipeTrainer:
         self.config = config
         self.tokenizer = tokenizer
 
+        # Handle both full Config and TrainingConfig (backward compatibility)
+        if hasattr(config, "training"):
+            # Full Config object
+            train_config = config.training
+        else:
+            # Legacy TrainingConfig only
+            train_config = config
+
         # Metrics
         self.char_accuracy = CharacterAccuracy()
         if tokenizer:
@@ -61,17 +69,17 @@ class SwipeTrainer:
             self.word_accuracy = None
 
         # TensorBoard logging
-        os.makedirs(config.log_dir, exist_ok=True)
-        self.writer = SummaryWriter(log_dir=config.log_dir)
+        os.makedirs(train_config.log_dir, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=train_config.log_dir)
         self.global_step = 0
 
         # Checkpointing
-        os.makedirs(config.checkpoint_dir, exist_ok=True)
+        os.makedirs(train_config.checkpoint_dir, exist_ok=True)
 
         # Determine dtype for mixed precision
         self.amp_dtype = None
-        if config.use_amp:
-            if config.amp_dtype == "bfloat16":
+        if train_config.use_amp:
+            if train_config.amp_dtype == "bfloat16":
                 self.amp_dtype = torch.bfloat16
             else:
                 self.amp_dtype = torch.float16
@@ -79,9 +87,12 @@ class SwipeTrainer:
         # Gradient scaler for mixed precision (only for float16, not bfloat16)
         self.scaler = (
             torch.cuda.amp.GradScaler()
-            if (config.use_amp and config.amp_dtype == "float16")
+            if (train_config.use_amp and train_config.amp_dtype == "float16")
             else None
         )
+
+        # Store train_config for easy access
+        self.train_config = train_config
 
     def train_epoch(self, epoch: int) -> float:
         """
@@ -102,7 +113,7 @@ class SwipeTrainer:
             batch = batch_to_device(batch, self.device)
 
             # Forward pass with mixed precision
-            if self.config.use_amp:
+            if self.train_config.use_amp:
                 with torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype):
                     outputs = self.model(
                         path_coords=batch["path_coords"],
@@ -148,7 +159,7 @@ class SwipeTrainer:
             current_lr = self.optimizer.param_groups[0]["lr"]
             pbar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{current_lr:.2e}"})
 
-            if self.global_step % self.config.log_interval == 0:
+            if self.global_step % self.train_config.log_interval == 0:
                 self.writer.add_scalar("train/loss", loss.item(), self.global_step)
                 self.writer.add_scalar("train/learning_rate", current_lr, self.global_step)
                 for k, v in losses.items():
@@ -156,7 +167,7 @@ class SwipeTrainer:
                         self.writer.add_scalar(f"train/{k}", v.item(), self.global_step)
 
             # Step-based validation
-            if self.global_step % self.config.val_interval == 0:
+            if self.global_step % self.train_config.val_interval == 0:
                 print(f"\n[Step {self.global_step}] Running validation...")
                 val_metrics = self.evaluate_step(self.global_step)
 
@@ -297,11 +308,11 @@ class SwipeTrainer:
             word_acc = self.word_accuracy.compute()
             metrics["word_accuracy"] = word_acc
 
-        # Log to TensorBoard
-        self.writer.add_scalar("eval/loss", avg_loss, epoch)
-        self.writer.add_scalar("eval/char_accuracy", char_acc, epoch)
+        # Log to TensorBoard (use global_step for proper alignment with training metrics)
+        self.writer.add_scalar("eval/loss", avg_loss, self.global_step)
+        self.writer.add_scalar("eval/char_accuracy", char_acc, self.global_step)
         if self.word_accuracy:
-            self.writer.add_scalar("eval/word_accuracy", word_acc, epoch)
+            self.writer.add_scalar("eval/word_accuracy", word_acc, self.global_step)
 
         # Print metrics
         print(
@@ -339,7 +350,7 @@ class SwipeTrainer:
         if self.scaler:
             checkpoint["scaler_state_dict"] = self.scaler.state_dict()
 
-        path = os.path.join(self.config.checkpoint_dir, filename)
+        path = os.path.join(self.train_config.checkpoint_dir, filename)
         torch.save(checkpoint, path)
         print(f"Saved checkpoint: {path}")
 
@@ -347,21 +358,21 @@ class SwipeTrainer:
         """
         Keep only the best checkpoint and N most recent epoch checkpoints.
         """
-        if not hasattr(self.config, "keep_n_checkpoints"):
+        if not hasattr(self.train_config, "keep_n_checkpoints"):
             return
 
         # Get all epoch checkpoints (exclude best_model.pt)
-        checkpoint_pattern = os.path.join(self.config.checkpoint_dir, "checkpoint_epoch_*.pt")
+        checkpoint_pattern = os.path.join(self.train_config.checkpoint_dir, "checkpoint_epoch_*.pt")
         epoch_checkpoints = glob.glob(checkpoint_pattern)
 
-        if len(epoch_checkpoints) <= self.config.keep_n_checkpoints:
+        if len(epoch_checkpoints) <= self.train_config.keep_n_checkpoints:
             return  # Nothing to clean up
 
         # Sort by modification time (newest first)
         epoch_checkpoints.sort(key=os.path.getmtime, reverse=True)
 
         # Keep only N most recent
-        checkpoints_to_delete = epoch_checkpoints[self.config.keep_n_checkpoints :]
+        checkpoints_to_delete = epoch_checkpoints[self.train_config.keep_n_checkpoints :]
 
         for checkpoint_path in checkpoints_to_delete:
             try:
@@ -394,7 +405,7 @@ class SwipeTrainer:
             eval_metrics = self.evaluate(epoch)
 
             # Save epoch checkpoint
-            if (epoch + 1) % self.config.save_interval == 0:
+            if (epoch + 1) % self.train_config.save_interval == 0:
                 self.save_checkpoint(f"checkpoint_epoch_{epoch + 1}.pt", epoch, eval_metrics)
                 self.cleanup_checkpoints()
 

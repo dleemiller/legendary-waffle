@@ -258,7 +258,7 @@ def main():
         scheduler=scheduler,
         loss_fn=loss_fn,
         device=device,
-        config=config.training,
+        config=config,  # Pass full Config object, not just config.training
         tokenizer=tokenizer,
     )
 
