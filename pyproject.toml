@@ -1,0 +1,57 @@
+[project]
+name = "swipealot"
+version = "0.1.0"
+description = "Swipe keyboard transformer model using multimodal embeddings"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+train = "swipealot.scripts.train:main"
+evaluate = "swipealot.scripts.evaluate:main"
+
+[project.optional-dependencies]
+cu128 = [
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+    "transformers>=4.57.1",
+    "datasets>=4.0.0",
+    "huggingface_hub>=0.34.4",
+    "tqdm>=4.66.4",
+    "rich>=14.2.0",
+    "scikit-learn>=1.7.1",
+    "tensorboard>=2.20.0",  # For logging and visualization
+    "matplotlib>=3.10.7",  # For plots
+    "seaborn>=0.13.2",  # For heatmaps
+    "pyyaml>=6.0",  # For config files
+    "numpy>=1.26.0",  # For data processing
+]
+dev = [
+    "pytest>=8.3.3",
+    "pytest-cov>=6.0.0",
+    "pytest-mock>=3.15.0",
+    "ruff>=0.14.7",
+    "pre-commit>=4.5.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

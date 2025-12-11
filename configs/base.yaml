@@ -1,0 +1,50 @@
+model:
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  d_ff: 3072
+  dropout: 0.1
+  vocab_size: 100  # will be set from tokenizer
+  max_path_len: 128
+  max_char_len: 48
+  predict_path: true
+
+data:
+  dataset_name: "futo-org/swipe.futo.org"
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+  max_path_len: 128
+  max_char_len: 48
+  char_mask_prob: 0.5
+  path_mask_prob: 0.5
+  mask_path: true
+  batch_size: 512
+  num_workers: 4
+
+training:
+  learning_rate: 0.0001
+  min_learning_rate: 0.00001
+  weight_decay: 0.01
+  num_epochs: 50
+  warmup_steps: 3600  # More warmup for larger model
+  char_loss_weight: 1.0
+  path_loss_weight: 0.5
+  log_interval: 100
+  val_interval: 1000
+  save_interval: 1
+  keep_n_checkpoints: 2  # Keep best + 2 most recent epoch checkpoints
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  device: "cuda"
+  use_amp: true
+  amp_dtype: "bfloat16"
+  use_focal_loss: true
+  focal_gamma: 2.0
+  use_char_freq_weights: false
+  char_freq_max_samples: 100000
+  char_weights_path: "checkpoints/char_weights.pt"
+  use_pairwise_masking: true
+  pairwise_modality_prob: 0.2  # 20% modality masking, 80% inverted masking
+  contrastive_weight: 0.1
+  contrastive_temperature: 0.05

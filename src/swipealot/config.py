@@ -1,0 +1,126 @@
+"""Configuration dataclasses for the swipe keyboard model."""
+
+from dataclasses import dataclass, field
+
+import yaml
+
+
+@dataclass
+class ModelConfig:
+    """Model architecture configuration."""
+
+    # Transformer architecture
+    d_model: int = 256
+    n_layers: int = 4
+    n_heads: int = 4
+    d_ff: int = 1024
+    dropout: float = 0.1
+
+    # Vocabulary (will be set from tokenizer)
+    vocab_size: int = 100
+
+    # Sequence lengths
+    max_path_len: int = 64
+    max_char_len: int = 38
+
+    # Tasks
+    predict_path: bool = True
+
+
+@dataclass
+class DataConfig:
+    """Data loading and preprocessing configuration."""
+
+    # Dataset
+    dataset_name: str = "futo-org/swipe.futo.org"
+    train_split: str = "train"
+    val_split: str = "validation"
+    test_split: str = "test"
+
+    # Data processing
+    max_path_len: int = 64
+    max_char_len: int = 38
+
+    # Masking strategy
+    char_mask_prob: float = 0.15
+    path_mask_prob: float = 0.15
+    mask_path: bool = True
+
+    # DataLoader
+    batch_size: int = 512
+    num_workers: int = 4
+
+
+@dataclass
+class TrainingConfig:
+    """Training configuration."""
+
+    # Optimization
+    learning_rate: float = 2e-4
+    min_learning_rate: float = 1e-5  # Minimum LR for cosine annealing
+    weight_decay: float = 0.01
+    num_epochs: int = 10
+    warmup_steps: int = 1000
+
+    # Loss weights
+    char_loss_weight: float = 1.0
+    path_loss_weight: float = 0.1
+
+    # Logging and checkpointing
+    log_interval: int = 100
+    val_interval: int = 1000  # Run validation every N steps
+    save_interval: int = 1  # Save checkpoint every N epochs
+    keep_n_checkpoints: int = 2  # Keep best + N most recent checkpoints
+    log_dir: str = "logs"
+    checkpoint_dir: str = "checkpoints"
+
+    # Device
+    device: str = "cuda"
+
+    # Mixed precision training
+    use_amp: bool = True
+    amp_dtype: str = "bfloat16"  # "bfloat16" or "float16"
+
+    # Character loss shaping
+    use_focal_loss: bool = False
+    focal_gamma: float = 0.0
+    use_char_freq_weights: bool = False
+    char_freq_max_samples: int = 100000
+    char_weights_path: str | None = None
+
+    # Pairwise masking + contrastive objective
+    use_pairwise_masking: bool = False
+    pairwise_modality_prob: float = 0.2  # Probability of using modality-based masking (vs inverted)
+    contrastive_weight: float = 0.0
+    contrastive_temperature: float = 0.1
+
+
+@dataclass
+class Config:
+    """Complete configuration combining all sub-configs."""
+
+    model: ModelConfig = field(default_factory=ModelConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "Config":
+        """Load configuration from YAML file."""
+        with open(path) as f:
+            config_dict = yaml.safe_load(f)
+
+        model_config = ModelConfig(**config_dict.get("model", {}))
+        data_config = DataConfig(**config_dict.get("data", {}))
+        training_config = TrainingConfig(**config_dict.get("training", {}))
+
+        return cls(model=model_config, data=data_config, training=training_config)
+
+    def to_yaml(self, path: str) -> None:
+        """Save configuration to YAML file."""
+        config_dict = {
+            "model": self.model.__dict__,
+            "data": self.data.__dict__,
+            "training": self.training.__dict__,
+        }
+        with open(path, "w") as f:
+            yaml.dump(config_dict, f, default_flow_style=False)

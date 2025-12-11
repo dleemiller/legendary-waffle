@@ -1,0 +1,51 @@
+model:
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+  d_ff: 1024
+  dropout: 0.1
+  vocab_size: 100  # Will be updated from tokenizer (case-insensitive: ~34 chars, case-sensitive: ~60 chars)
+  max_path_len: 128  # Covers 82% of data with linear interpolation downsampling
+  max_char_len: 48
+  predict_path: true
+
+data:
+  dataset_name: "futo-org/swipe.futo.org"
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test"
+  max_path_len: 128  # Linear interpolation for paths >128 points (18% of data)
+  max_char_len: 48
+  char_mask_prob: 0.50
+  path_mask_prob: 0.50
+  mask_path: true
+  batch_size: 512
+  num_workers: 4
+
+training:
+  learning_rate: 0.0002
+  min_learning_rate: 0.00002  # Minimum LR for cosine annealing (10% of max)
+  weight_decay: 0.01
+  num_epochs: 10
+  warmup_steps: 1000
+  char_loss_weight: 1.0
+  path_loss_weight: 0.5
+  log_interval: 100
+  val_interval: 500  # Run validation every 1000 steps
+  save_interval: 1
+  keep_n_checkpoints: 2  # Keep best + 2 most recent epoch checkpoints
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  device: "cuda"
+  use_amp: true
+  amp_dtype: "bfloat16"  # bfloat16 is more stable than float16
+  # Loss shaping
+  use_focal_loss: true
+  focal_gamma: 2.0
+  use_char_freq_weights: false  # weights provided via char_weights_path
+  char_freq_max_samples: 100000
+  char_weights_path: "checkpoints/char_weights.pt"
+  use_pairwise_masking: true
+  pairwise_modality_prob: 0.2  # 20% modality masking, 80% inverted masking
+  contrastive_weight: 0.5
+  contrastive_temperature: 0.1
