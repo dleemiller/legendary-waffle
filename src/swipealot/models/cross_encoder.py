@@ -159,7 +159,7 @@ class SwipeCrossEncoderModel(nn.Module):
         base_model = SwipeTransformerModel(config)
 
         # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
         # Handle different checkpoint formats
         if "model_state_dict" in checkpoint:

@@ -22,10 +22,10 @@ class TestMultipleNegativesRankingLoss:
         assert loss_fn.scale == 20.0
         assert isinstance(loss_fn.activation_fn, nn.Tanh)
 
-    def test_initialization_no_activation(self):
-        """Test loss initialization without activation function."""
-        loss_fn = MultipleNegativesRankingLoss(activation_fn=None)
-        assert loss_fn.activation_fn is None
+    def test_initialization_default_activation(self):
+        """Test loss initialization with default Sigmoid activation."""
+        loss_fn = MultipleNegativesRankingLoss()
+        assert isinstance(loss_fn.activation_fn, nn.Sigmoid)
 
     def test_forward_shape(self):
         """Test forward pass returns scalar loss."""
@@ -42,7 +42,7 @@ class TestMultipleNegativesRankingLoss:
 
     def test_forward_perfect_predictions(self):
         """Test loss when positive is clearly highest."""
-        loss_fn = MultipleNegativesRankingLoss(activation_fn=None, scale=1.0)
+        loss_fn = MultipleNegativesRankingLoss(activation_fn=nn.Identity(), scale=1.0)
 
         # Positive (index 0) has much higher score than negatives
         scores = torch.tensor(
@@ -59,7 +59,7 @@ class TestMultipleNegativesRankingLoss:
 
     def test_forward_worst_predictions(self):
         """Test loss when positive is clearly lowest."""
-        loss_fn = MultipleNegativesRankingLoss(activation_fn=None, scale=1.0)
+        loss_fn = MultipleNegativesRankingLoss(activation_fn=nn.Identity(), scale=1.0)
 
         # Positive (index 0) has much lower score than negatives
         scores = torch.tensor(
@@ -89,7 +89,7 @@ class TestMultipleNegativesRankingLoss:
 
     def test_labels_default_to_zeros(self):
         """Test that labels default to zeros (positive at index 0)."""
-        loss_fn = MultipleNegativesRankingLoss(activation_fn=None, scale=1.0)
+        loss_fn = MultipleNegativesRankingLoss(activation_fn=nn.Identity(), scale=1.0)
 
         scores = torch.randn(4, 4)
 
@@ -99,7 +99,7 @@ class TestMultipleNegativesRankingLoss:
 
     def test_labels_explicit(self):
         """Test with explicit labels."""
-        loss_fn = MultipleNegativesRankingLoss(activation_fn=None, scale=1.0)
+        loss_fn = MultipleNegativesRankingLoss(activation_fn=nn.Identity(), scale=1.0)
 
         scores = torch.randn(4, 4)
         labels = torch.zeros(4, dtype=torch.long)  # All zeros
@@ -154,11 +154,11 @@ class TestMultipleNegativesRankingLoss:
         )
 
         # Loss with low scale
-        loss_fn_low = MultipleNegativesRankingLoss(scale=1.0, activation_fn=None)
+        loss_fn_low = MultipleNegativesRankingLoss(scale=1.0, activation_fn=nn.Identity())
         loss_low = loss_fn_low(scores)
 
         # Loss with high scale
-        loss_fn_high = MultipleNegativesRankingLoss(scale=100.0, activation_fn=None)
+        loss_fn_high = MultipleNegativesRankingLoss(scale=100.0, activation_fn=nn.Identity())
         loss_high = loss_fn_high(scores)
 
         # Higher scale should generally lead to different loss values

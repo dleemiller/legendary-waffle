@@ -1,5 +1,6 @@
 """Hard negative mining using character bigrams and Jaccard similarity for cross-encoder training."""
 
+import string
 from collections import defaultdict
 
 import pandas as pd
@@ -40,6 +41,28 @@ def jaccard_similarity(set1: set[str], set2: set[str]) -> float:
     intersection = len(set1 & set2)
     union = len(set1 | set2)
     return intersection / union if union > 0 else 0.0
+
+
+def normalize_word(word: str) -> str:
+    """
+    Normalize word by removing punctuation and lowercasing.
+
+    This is used to filter out trivial variations like "grip" vs "grip."
+    which would be too easy as negatives.
+
+    Args:
+        word: Input word
+
+    Returns:
+        Normalized word (no punctuation, lowercase)
+
+    Examples:
+        "grip" → "grip"
+        "grip." → "grip"
+        "GRIP," → "grip"
+        "grips" → "grips"
+    """
+    return word.translate(str.maketrans("", "", string.punctuation)).lower()
 
 
 def compute_difficulty_score(jaccard: float, length_diff: int) -> float:
@@ -136,6 +159,10 @@ def build_negative_pool(
 
         # Score candidates
         for candidate in candidate_words:
+            # Filter out trivial variations (same word after removing punctuation)
+            if normalize_word(word) == normalize_word(candidate):
+                continue
+
             # Filter by length difference
             length_diff = abs(len(word) - len(candidate))
             if length_diff > max_length_diff:

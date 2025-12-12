@@ -132,6 +132,7 @@ class CrossEncoderTrainingConfig:
     # Optimization
     head_learning_rate: float = 1e-4  # LR for classification head
     encoder_learning_rate: float = 5e-6  # LR for encoder (when unfrozen)
+    min_learning_rate: float = 5e-6  # Minimum LR for cosine annealing (10% of head LR)
     weight_decay: float = 0.01
     num_epochs: int = 10
     warmup_steps: int = 500

@@ -9,6 +9,7 @@ from src.swipealot.data.negative_mining import (
     get_bigrams,
     jaccard_similarity,
     load_negative_pool,
+    normalize_word,
     save_negative_pool,
 )
 
@@ -70,6 +71,39 @@ class TestJaccardSimilarity:
         assert jaccard_similarity(set(), set()) == 0.0
         assert jaccard_similarity({"ab"}, set()) == 0.0
         assert jaccard_similarity(set(), {"ab"}) == 0.0
+
+
+class TestNormalization:
+    """Test word normalization."""
+
+    def test_normalize_no_punctuation(self):
+        """Test normalization of word without punctuation."""
+        assert normalize_word("grip") == "grip"
+        assert normalize_word("hello") == "hello"
+
+    def test_normalize_with_punctuation(self):
+        """Test normalization removes punctuation."""
+        assert normalize_word("grip.") == "grip"
+        assert normalize_word("grip,") == "grip"
+        assert normalize_word("grip!") == "grip"
+        assert normalize_word("hello?") == "hello"
+
+    def test_normalize_case_insensitive(self):
+        """Test normalization lowercases."""
+        assert normalize_word("GRIP") == "grip"
+        assert normalize_word("Grip") == "grip"
+        assert normalize_word("GrIp") == "grip"
+
+    def test_normalize_combined(self):
+        """Test normalization with both punctuation and case."""
+        assert normalize_word("GRIP.") == "grip"
+        assert normalize_word("Hello,") == "hello"
+        assert normalize_word("WORLD!") == "world"
+
+    def test_normalize_preserves_different_words(self):
+        """Test normalization keeps different words different."""
+        assert normalize_word("grip") != normalize_word("grips")
+        assert normalize_word("hello") != normalize_word("world")
 
 
 class TestDifficultyScore:
@@ -162,6 +196,28 @@ class TestBuildNegativePool:
         if "abc" in pool and pool["abc"]:
             abc_negatives = [neg for neg, _ in pool["abc"]]
             assert "xyz" not in abc_negatives
+
+    def test_punctuation_filter(self):
+        """Test that trivial punctuation variations are filtered out."""
+        words = ["grip", "grip.", "grip,", "grips", "grim", "trip"]
+        pool = build_negative_pool(
+            words=words,
+            num_negatives=10,
+            min_jaccard=0.2,
+            max_jaccard=0.9,
+            max_length_diff=2,
+        )
+
+        # "grip" should NOT have "grip." or "grip," as negatives (same word)
+        grip_negatives = [neg for neg, _ in pool["grip"]]
+        assert "grip." not in grip_negatives, "grip. should be filtered (same as grip)"
+        assert "grip," not in grip_negatives, "grip, should be filtered (same as grip)"
+
+        # "grip" SHOULD have genuinely different words
+        # Note: "grips" is kept (different word), "grim" and "trip" should be there too
+        assert any(neg in ["grim", "trip"] for neg in grip_negatives), (
+            "Should have genuinely different words as negatives"
+        )
 
     def test_difficulty_ordering(self):
         """Test that negatives are sorted by difficulty (descending)."""

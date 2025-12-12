@@ -73,13 +73,16 @@ class CrossEncoderDataset(Dataset):
             print(f"Loading negative pool from: {negative_pool_path}")
             self.negative_pool = load_negative_pool(negative_pool_path)
             print(f"Loaded negatives for {len(self.negative_pool)} words")
+            # Use negative pool keys as vocabulary (fast)
+            self.all_words = list(self.negative_pool.keys())
+            print(f"Vocabulary: {len(self.all_words)} unique words (from negative pool)")
         else:
             print("Warning: No negative pool provided. Will use random negatives.")
             self.negative_pool = None
-
-        # Extract all unique words for random negative sampling fallback
-        self.all_words = list(set(sample["word"].lower() for sample in self.dataset))
-        print(f"Vocabulary: {len(self.all_words)} unique words")
+            # Extract all unique words for random negative sampling fallback
+            print("Extracting vocabulary from dataset (this may take a minute)...")
+            self.all_words = list(set(sample["word"].lower() for sample in self.dataset))
+            print(f"Vocabulary: {len(self.all_words)} unique words")
 
     def _sample_negatives(self, positive_word: str) -> list[str]:
         """

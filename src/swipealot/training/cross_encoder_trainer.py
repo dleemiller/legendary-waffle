@@ -193,6 +193,20 @@ class CrossEncoderTrainer:
                 val_loss, val_accuracy = self.validate()
                 self.writer.add_scalar("val/loss", val_loss, self.global_step)
                 self.writer.add_scalar("val/accuracy", val_accuracy, self.global_step)
+
+                # Save checkpoint after validation
+                checkpoint_path = os.path.join(
+                    self.train_config.checkpoint_dir, f"checkpoint_step_{self.global_step}.pt"
+                )
+                self.save_checkpoint(checkpoint_path, epoch, val_accuracy)
+
+                # Save best model if accuracy improved
+                if val_accuracy > self.best_val_accuracy:
+                    self.best_val_accuracy = val_accuracy
+                    best_path = os.path.join(self.train_config.checkpoint_dir, "best_model.pt")
+                    self.save_checkpoint(best_path, epoch, val_accuracy)
+                    print(f"New best model saved! Accuracy: {val_accuracy:.4f}")
+
                 self.model.train()
 
         avg_loss = sum(epoch_losses) / len(epoch_losses)
