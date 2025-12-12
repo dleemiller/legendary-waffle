@@ -36,7 +36,7 @@ class MaskedCollator:
 
     def mask_characters(self, char_tokens: torch.Tensor, char_mask: torch.Tensor) -> tuple:
         """
-        Mask character tokens following BERT strategy.
+        Mask character tokens following BERT strategy (vectorized).
 
         Args:
             char_tokens: [batch, seq_len] character token IDs
@@ -51,33 +51,40 @@ class MaskedCollator:
         masked_tokens = char_tokens.clone()
         labels = torch.full_like(char_tokens, -100)  # -100 is ignored by CrossEntropyLoss
 
-        for i in range(batch_size):
-            for j in range(seq_len):
-                # Only mask valid (non-padding) tokens
-                if char_mask[i, j] == 0:
-                    continue
+        # Vectorized masking: create random decisions for all tokens
+        mask_decisions = torch.rand(batch_size, seq_len) < self.char_mask_prob
+        mask_decisions = mask_decisions & (char_mask == 1)  # Only mask valid tokens
 
-                # Decide whether to mask this token
-                if random.random() < self.char_mask_prob:
-                    labels[i, j] = char_tokens[i, j]  # Store original token as label
+        # For tokens we decided to mask, store original as label
+        labels[mask_decisions] = char_tokens[mask_decisions]
 
-                    # BERT masking strategy
-                    prob = random.random()
-                    if prob < 0.8:
-                        # 80%: Replace with [MASK]
-                        masked_tokens[i, j] = self.tokenizer.mask_token_id
-                    elif prob < 0.9:
-                        # 10%: Replace with random token (not special tokens)
-                        masked_tokens[i, j] = random.randint(
-                            len(self.tokenizer.special_tokens), self.tokenizer.vocab_size - 1
-                        )
-                    # else 10%: Keep original (including EOS if it was selected)
+        # BERT masking strategy (vectorized)
+        # For each token to mask, decide: 80% MASK, 10% random, 10% keep
+        bert_probs = torch.rand(batch_size, seq_len)
+
+        # 80%: Replace with [MASK]
+        use_mask_token = mask_decisions & (bert_probs < 0.8)
+        masked_tokens[use_mask_token] = self.tokenizer.mask_token_id
+
+        # 10%: Replace with random token
+        use_random_token = mask_decisions & (bert_probs >= 0.8) & (bert_probs < 0.9)
+        num_random = use_random_token.sum().item()
+        if num_random > 0:
+            random_tokens = torch.randint(
+                len(self.tokenizer.special_tokens),
+                self.tokenizer.vocab_size,
+                (num_random,),
+                dtype=char_tokens.dtype,
+            )
+            masked_tokens[use_random_token] = random_tokens
+
+        # 10%: Keep original (no action needed)
 
         return masked_tokens, labels
 
     def mask_path_points(self, path_coords: torch.Tensor, path_mask: torch.Tensor) -> tuple:
         """
-        Mask path coordinates by replacing with zeros.
+        Mask path coordinates by replacing with zeros (vectorized).
 
         Args:
             path_coords: [batch, seq_len, 3] path coordinates
@@ -92,18 +99,14 @@ class MaskedCollator:
         batch_size, seq_len, _ = path_coords.shape
         masked_coords = path_coords.clone()
         labels = path_coords.clone()
-        mask_indices = torch.zeros(batch_size, seq_len, dtype=torch.long)
 
-        for i in range(batch_size):
-            for j in range(seq_len):
-                # Only mask valid (non-padding) points
-                if path_mask[i, j] == 0:
-                    continue
+        # Vectorized masking: create random decisions for all points
+        mask_decisions = torch.rand(batch_size, seq_len) < self.path_mask_prob
+        mask_decisions = mask_decisions & (path_mask == 1)  # Only mask valid points
 
-                # Decide whether to mask this point
-                if random.random() < self.path_mask_prob:
-                    masked_coords[i, j] = 0.0  # Zero out the coordinates
-                    mask_indices[i, j] = 1
+        # Zero out masked coordinates
+        mask_indices = mask_decisions.long()
+        masked_coords[mask_decisions] = 0.0
 
         return masked_coords, labels, mask_indices
 
@@ -405,16 +408,13 @@ class ValidationCollator:
         path_mask = torch.stack([item["path_mask"] for item in batch])
         char_mask = torch.stack([item["char_mask"] for item in batch])
 
-        # Create labels for all valid (non-padding) positions
+        # Create labels for all valid (non-padding) positions (vectorized)
         # We want to evaluate prediction on all real tokens (excluding PAD)
-        batch_size, char_len = char_tokens.shape
+        batch_size = char_tokens.shape[0]
         char_labels = char_tokens.clone()
 
         # Set padding positions to -100 (ignore in loss)
-        for i in range(batch_size):
-            for j in range(char_len):
-                if char_mask[i, j] == 0:  # padding
-                    char_labels[i, j] = -100
+        char_labels[char_mask == 0] = -100
 
         # Create attention mask: [CLS] + path + [SEP] + chars
         cls_mask = torch.ones(batch_size, 1, dtype=torch.long)
@@ -429,4 +429,89 @@ class ValidationCollator:
             "char_mask": char_mask,
             "attention_mask": attention_mask,
             "words": [item["word"] for item in batch],
+        }
+
+
+class CrossEncoderCollator:
+    """
+    Collator for cross-encoder training with Multiple Negatives Ranking Loss.
+
+    Batches (path, positive, negative_1, ..., negative_n) tuples.
+    Each query has 1 positive + N negatives.
+    """
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, batch):
+        """
+        Collate batch of cross-encoder samples.
+
+        Input: List of dicts with:
+            - path_coords: [path_len, 3]
+            - positive_word: [word_len]
+            - negative_words: [num_negatives, word_len]
+
+        Output: Dict with:
+            - path_coords: [batch * (1+N), path_len, 3]  # Repeated for each word
+            - char_tokens: [batch * (1+N), word_len]     # Positive + negatives
+            - attention_mask: [batch * (1+N), seq_len]
+            - labels: [batch] with value 0 (positive is always first in each group)
+            - group_sizes: [batch] with value (1+N) for each query
+        """
+        batch_size = len(batch)
+        num_negatives = batch[0]["negative_words"].shape[0]
+        docs_per_query = 1 + num_negatives  # 1 positive + N negatives
+
+        # Lists to accumulate all pairs
+        all_path_coords = []
+        all_path_masks = []
+        all_char_tokens = []
+        all_char_masks = []
+
+        # Process each query
+        for item in batch:
+            path_coords = item["path_coords"]  # [path_len, 3]
+            path_mask = item["path_mask"]  # [path_len]
+
+            # Positive pair
+            all_path_coords.append(path_coords)
+            all_path_masks.append(path_mask)
+            all_char_tokens.append(item["positive_word"])
+            all_char_masks.append(item["positive_mask"])
+
+            # Negative pairs
+            for i in range(num_negatives):
+                all_path_coords.append(path_coords)  # Same path repeated
+                all_path_masks.append(path_mask)
+                all_char_tokens.append(item["negative_words"][i])
+                all_char_masks.append(item["negative_masks"][i])
+
+        # Stack all pairs
+        path_coords = torch.stack(all_path_coords)  # [batch*(1+N), path_len, 3]
+        path_mask = torch.stack(all_path_masks)  # [batch*(1+N), path_len]
+        char_tokens = torch.stack(all_char_tokens)  # [batch*(1+N), word_len]
+        char_mask = torch.stack(all_char_masks)  # [batch*(1+N), word_len]
+
+        # Create attention mask: [CLS] + path + [SEP] + chars
+        batch_pairs = path_coords.shape[0]
+        cls_mask = torch.ones(batch_pairs, 1, dtype=torch.long)
+        sep_mask = torch.ones(batch_pairs, 1, dtype=torch.long)
+        attention_mask = torch.cat([cls_mask, path_mask, sep_mask, char_mask], dim=1)
+
+        # Labels: positive is always at index 0 within each group
+        labels = torch.zeros(batch_size, dtype=torch.long)
+
+        # Group sizes: how many docs per query
+        group_sizes = torch.full((batch_size,), docs_per_query, dtype=torch.long)
+
+        return {
+            "path_coords": path_coords,
+            "char_tokens": char_tokens,
+            "path_mask": path_mask,
+            "char_mask": char_mask,
+            "attention_mask": attention_mask,
+            "labels": labels,  # Positive is always index 0
+            "group_sizes": group_sizes,  # For reshaping scores
+            "batch_size": batch_size,  # Original batch size
         }

@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-import yaml
+from omegaconf import OmegaConf
 
 
 @dataclass
@@ -96,6 +96,89 @@ class TrainingConfig:
 
 
 @dataclass
+class CrossEncoderDataConfig:
+    """Data configuration for cross-encoder training."""
+
+    # Dataset
+    dataset_name: str = "futo-org/swipe.futo.org"
+    train_split: str = "train"
+    val_split: str = "validation"
+    test_split: str = "test"
+
+    # Negative mining
+    negative_pool_path: str | None = None
+    num_negatives: int = 3  # Number of negatives per positive (1:3 ratio)
+    difficulty_sampling: bool = True  # Sample negatives by difficulty score
+
+    # Sequence lengths
+    max_path_len: int = 64
+    max_word_len: int = 48
+
+    # DataLoader
+    batch_size: int = 256
+    num_workers: int = 4
+
+
+@dataclass
+class CrossEncoderTrainingConfig:
+    """Training configuration for cross-encoder."""
+
+    # Pretrained model
+    base_checkpoint: str | None = None  # Path to pretrained encoder checkpoint
+
+    # Encoder freezing
+    freeze_encoder: bool = True  # Freeze encoder during training
+
+    # Optimization
+    head_learning_rate: float = 1e-4  # LR for classification head
+    encoder_learning_rate: float = 5e-6  # LR for encoder (when unfrozen)
+    min_learning_rate: float = 5e-6  # Minimum LR for cosine annealing (10% of head LR)
+    weight_decay: float = 0.01
+    num_epochs: int = 10
+    warmup_steps: int = 500
+
+    # Loss
+    mnr_scale: float = 10.0  # Temperature scaling for MNR loss
+
+    # Logging and checkpointing
+    log_interval: int = 100
+    val_interval: int = 500
+    save_interval: int = 1
+    keep_n_checkpoints: int = 2
+    log_dir: str = "logs/cross_encoder"
+    checkpoint_dir: str = "checkpoints/cross_encoder"
+
+    # Device
+    device: str = "cuda"
+
+    # Mixed precision
+    use_amp: bool = True
+    amp_dtype: str = "bfloat16"
+
+
+@dataclass
+class CrossEncoderConfig:
+    """Complete configuration for cross-encoder training."""
+
+    model: ModelConfig = field(default_factory=ModelConfig)
+    data: CrossEncoderDataConfig = field(default_factory=CrossEncoderDataConfig)
+    training: CrossEncoderTrainingConfig = field(default_factory=CrossEncoderTrainingConfig)
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "CrossEncoderConfig":
+        """Load configuration from YAML file."""
+        yaml_conf = OmegaConf.load(path)
+        structured_conf = OmegaConf.structured(cls)
+        merged = OmegaConf.merge(structured_conf, yaml_conf)
+        return OmegaConf.to_object(merged)
+
+    def to_yaml(self, path: str) -> None:
+        """Save configuration to YAML file."""
+        conf = OmegaConf.structured(self)
+        OmegaConf.save(conf, path)
+
+
+@dataclass
 class Config:
     """Complete configuration combining all sub-configs."""
 
@@ -105,22 +188,28 @@ class Config:
 
     @classmethod
     def from_yaml(cls, path: str) -> "Config":
-        """Load configuration from YAML file."""
-        with open(path) as f:
-            config_dict = yaml.safe_load(f)
+        """
+        Load configuration from YAML file using OmegaConf.
 
-        model_config = ModelConfig(**config_dict.get("model", {}))
-        data_config = DataConfig(**config_dict.get("data", {}))
-        training_config = TrainingConfig(**config_dict.get("training", {}))
+        Provides validation, type checking, and better error messages.
+        Supports variable interpolation (e.g., ${model.d_model}).
+        """
+        # Load YAML and merge with structured config for validation
+        yaml_conf = OmegaConf.load(path)
 
-        return cls(model=model_config, data=data_config, training=training_config)
+        # Create structured config from dataclass (provides validation)
+        structured_conf = OmegaConf.structured(cls)
+
+        # Merge YAML onto structured config (validates types and structure)
+        merged = OmegaConf.merge(structured_conf, yaml_conf)
+
+        # Convert to regular dataclass instance
+        return OmegaConf.to_object(merged)
 
     def to_yaml(self, path: str) -> None:
-        """Save configuration to YAML file."""
-        config_dict = {
-            "model": self.model.__dict__,
-            "data": self.data.__dict__,
-            "training": self.training.__dict__,
-        }
-        with open(path, "w") as f:
-            yaml.dump(config_dict, f, default_flow_style=False)
+        """Save configuration to YAML file using OmegaConf."""
+        # Convert dataclass to OmegaConf
+        conf = OmegaConf.structured(self)
+
+        # Save to file
+        OmegaConf.save(conf, path)

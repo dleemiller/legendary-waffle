@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from swipealot.data import MaskedCollator, SwipeDataset
+from swipealot.data import SwipeDataset, ValidationCollator
 from swipealot.models import SwipeTransformerModel
 from swipealot.training import CharacterAccuracy, WordAccuracy
 from swipealot.utils import batch_to_device, extract_character_logits
@@ -28,7 +28,7 @@ def evaluate_model(model, test_loader, tokenizer, device):
     """
     model.eval()
 
-    char_accuracy = CharacterAccuracy()
+    char_accuracy = CharacterAccuracy(vocab_size=tokenizer.vocab_size, device=str(device))
     word_accuracy = WordAccuracy(tokenizer)
 
     all_predictions = []
@@ -174,7 +174,9 @@ def main():
     )
     parser.add_argument("--show_examples", action="store_true", help="Show example predictions")
     parser.add_argument(
-        "--visualize", action="store_true", help="Create visualization of swipe paths and predictions"
+        "--visualize",
+        action="store_true",
+        help="Create visualization of swipe paths and predictions",
     )
     parser.add_argument(
         "--viz_samples", type=int, default=20, help="Number of samples to visualize"
@@ -205,11 +207,14 @@ def main():
         d_model = model_state["embeddings.path_embedding.projection.weight"].shape[0]
 
         # n_layers by counting encoder layers
-        n_layers = max(
-            int(key.split(".")[2])
-            for key in model_state.keys()
-            if key.startswith("encoder.layers.")
-        ) + 1
+        n_layers = (
+            max(
+                int(key.split(".")[2])
+                for key in model_state.keys()
+                if key.startswith("encoder.layers.")
+            )
+            + 1
+        )
 
         # d_ff from first linear layer
         d_ff = model_state["encoder.layers.0.linear1.weight"].shape[0]
@@ -284,13 +289,9 @@ def main():
         max_samples=args.num_samples,
     )
 
-    # For evaluation we leave swipe paths untouched and mask all characters.
-    collator = MaskedCollator(
-        tokenizer=tokenizer,
-        char_mask_prob=1.0,  # mask every character token (including EOS)
-        path_mask_prob=0.0,  # never mask path points
-        mask_path=False,  # keep paths unmasked
-    )
+    # For evaluation, use ValidationCollator which provides deterministic results
+    # (no random masking, evaluates full reconstruction from unmasked input)
+    collator = ValidationCollator(tokenizer=tokenizer)
 
     test_loader = DataLoader(
         test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, collate_fn=collator
