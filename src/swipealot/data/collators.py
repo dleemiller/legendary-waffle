@@ -183,17 +183,26 @@ class PairwiseMaskedCollator:
     """
 
     def __init__(
-        self, tokenizer: CharacterTokenizer, mask_path: bool = True, modality_prob: float = 0.2
+        self,
+        tokenizer: CharacterTokenizer,
+        mask_path: bool = True,
+        modality_prob: float = 0.2,
+        zero_text_attention_prob: float = 0.5,
     ):
         """
         Args:
             tokenizer: Character tokenizer
             mask_path: Whether to mask path coordinates
             modality_prob: Probability of using modality-based masking (vs inverted)
+            zero_text_attention_prob: Probability of fully zeroing text attention in
+                the text-masked view to teach path-only embeddings (simulates inference
+                when text length is unknown)
         """
         self.tokenizer = tokenizer
         self.mask_path = mask_path
         self.modality_prob = modality_prob
+        self.zero_text_attention_prob = zero_text_attention_prob
+        self.max_char_len = None  # derived per-sample
 
     def _create_inverted_masks(
         self, path_coords, path_mask, char_tokens, char_mask, heavy_aug: bool
@@ -301,6 +310,12 @@ class PairwiseMaskedCollator:
         views_path_mask_indices = []
         pair_ids = []
         gradient_mask = []  # 1 = gets gradients (query), 0 = detached (key)
+        length_targets = []
+        length_supervise_mask = []
+
+        def _swipable_length(word: str, max_len: int) -> int:
+            length = sum(1 for c in word.lower() if c.isalpha() or c.isdigit())
+            return min(length, max_len)
 
         for pair_id, item in enumerate(batch):
             path_coords = item["path_coords"]
@@ -345,16 +360,41 @@ class PairwiseMaskedCollator:
             masked_path_a = self._apply_path_mask(path_coords, path_mask_a)
             masked_char_a, labels_a = self._apply_char_mask(char_tokens, char_mask_a)
 
+            # Optionally zero out text attention for the text-masked view to remove
+            # length information (simulates path-only inference when text is unknown).
+            # We only do this when text is the modality being masked (char_mask_a all 1s
+            # and path is visible).
+            use_zero_text_attn = (
+                use_modality_mode
+                and self.zero_text_attention_prob > 0.0
+                and random.random() < self.zero_text_attention_prob
+            )
+            if use_zero_text_attn:
+                # No attention to text positions; also drop char loss for this view.
+                attn_mask_a = torch.cat(
+                    [cls_mask, path_mask, sep_mask, torch.zeros_like(char_mask)], dim=0
+                )
+                masked_char_a = torch.full_like(char_tokens, self.tokenizer.pad_token_id)
+                labels_a = torch.full_like(char_tokens, -100)
+                char_mask_view_a = torch.zeros_like(char_mask)
+                length_supervise = 1
+            else:
+                attn_mask_a = attn_base
+                char_mask_view_a = char_mask
+                length_supervise = 0
+
             views_paths.append(masked_path_a)
             views_tokens.append(masked_char_a)
             views_labels.append(labels_a)
-            views_attention.append(attn_base)
-            views_char_mask.append(char_mask)
+            views_attention.append(attn_mask_a)
+            views_char_mask.append(char_mask_view_a)
             views_path_mask.append(path_mask)
             views_path_labels.append(path_coords)
             views_path_mask_indices.append(path_mask_a)
             pair_ids.append(pair_id)
             gradient_mask.append(gradient_a)
+            length_targets.append(_swipable_length(item["word"], char_tokens.shape[0]))
+            length_supervise_mask.append(length_supervise)
 
             # Create View B (key)
             masked_path_b = self._apply_path_mask(path_coords, path_mask_b)
@@ -370,6 +410,8 @@ class PairwiseMaskedCollator:
             views_path_mask_indices.append(path_mask_b)
             pair_ids.append(pair_id)
             gradient_mask.append(gradient_b)
+            length_targets.append(_swipable_length(item["word"], char_tokens.shape[0]))
+            length_supervise_mask.append(0)  # never supervise on key
 
         result = {
             "path_coords": torch.stack(views_paths),
@@ -386,6 +428,9 @@ class PairwiseMaskedCollator:
         if self.mask_path:
             result["path_labels"] = torch.stack(views_path_labels)
             result["path_mask_indices"] = torch.stack(views_path_mask_indices)
+
+        result["length_target"] = torch.tensor(length_targets, dtype=torch.long)
+        result["length_supervise_mask"] = torch.tensor(length_supervise_mask, dtype=torch.long)
 
         return result
 

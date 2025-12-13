@@ -25,6 +25,7 @@ class ModelConfig:
 
     # Tasks
     predict_path: bool = True
+    predict_length: bool = True  # Auxiliary CLS head to predict swipable length
 
 
 @dataclass
@@ -65,6 +66,7 @@ class TrainingConfig:
     # Loss weights
     char_loss_weight: float = 1.0
     path_loss_weight: float = 0.1
+    length_loss_weight: float = 0.1  # Auxiliary CLS length prediction
 
     # Logging and checkpointing
     log_interval: int = 100
@@ -93,6 +95,10 @@ class TrainingConfig:
     pairwise_modality_prob: float = 0.2  # Probability of using modality-based masking (vs inverted)
     contrastive_weight: float = 0.0
     contrastive_temperature: float = 0.1
+
+    # matryoshka settings
+    matryoshka_dims: list[int] | None = None
+    matryoshka_weights: list[float] | None = None
 
 
 @dataclass

@@ -26,7 +26,7 @@ training:
   learning_rate: 0.0001
   min_learning_rate: 0.00001
   weight_decay: 0.01
-  num_epochs: 50
+  num_epochs: 40
   warmup_steps: 3600  # More warmup for larger model
   char_loss_weight: 1.0
   path_loss_weight: 0.5
@@ -46,5 +46,8 @@ training:
   char_weights_path: "checkpoints/char_weights.pt"
   use_pairwise_masking: true
   pairwise_modality_prob: 0.2  # 20% modality masking, 80% inverted masking
-  contrastive_weight: 0.1
-  contrastive_temperature: 0.05
+  contrastive_weight: 0.15
+  contrastive_temperature: 0.07
+  matryoshka_dims: [64, 128, 384, 768]
+  matryoshka_weights: [2.0, 1.5, 1.0, 1.0]
+  length_loss_weight: 0.1

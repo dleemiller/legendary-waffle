@@ -83,3 +83,27 @@ class ClassificationHead(nn.Module):
         x = self.norm(x)  # LayerNorm
         logits = self.classifier(x)  # [batch, 1] or [batch, num_labels]
         return logits
+
+
+class LengthPredictionHead(nn.Module):
+    """Predict sequence length (e.g., swipable character count) from CLS embedding."""
+
+    def __init__(self, d_model: int, max_length: int):
+        super().__init__()
+        self.dense = nn.Linear(d_model, d_model)
+        self.activation = nn.GELU()
+        self.norm = nn.LayerNorm(d_model)
+        self.classifier = nn.Linear(d_model, max_length + 1)  # classes: 0..max_length
+
+    def forward(self, cls_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            cls_features: [batch, d_model] CLS embeddings
+
+        Returns:
+            [batch, max_length+1] logits over lengths
+        """
+        x = self.dense(cls_features)
+        x = self.activation(x)
+        x = self.norm(x)
+        return self.classifier(x)

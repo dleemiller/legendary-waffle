@@ -242,10 +242,13 @@ def main():
     loss_fn = SwipeLoss(
         char_weight=config.training.char_loss_weight,
         path_weight=config.training.path_loss_weight,
+        length_weight=config.training.length_loss_weight,
         focal_gamma=config.training.focal_gamma if config.training.use_focal_loss else 0.0,
         char_class_weights=char_freq_weights,
         contrastive_weight=config.training.contrastive_weight,
         contrastive_temperature=config.training.contrastive_temperature,
+        matryoshka_dims=config.training.matryoshka_dims,
+        matryoshka_weights=config.training.matryoshka_weights,
     )
 
     # Create trainer

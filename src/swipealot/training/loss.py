@@ -14,10 +14,13 @@ class SwipeLoss(nn.Module):
         self,
         char_weight: float = 1.0,
         path_weight: float = 0.1,
+        length_weight: float = 0.0,
         focal_gamma: float = 0.0,
         char_class_weights: torch.Tensor | None = None,
         contrastive_weight: float = 0.0,
         contrastive_temperature: float = 0.1,
+        matryoshka_dims: list[int] | None = None,
+        matryoshka_weights: list[float] | None = None,
     ):
         """
         Initialize loss function.
@@ -29,15 +32,73 @@ class SwipeLoss(nn.Module):
         super().__init__()
         self.char_weight = char_weight
         self.path_weight = path_weight
+        self.length_weight = length_weight
         self.focal_gamma = focal_gamma
         self.contrastive_weight = contrastive_weight
         self.contrastive_temperature = contrastive_temperature
+
+        # Matryoshka settings
+        self.matryoshka_dims = matryoshka_dims
+        self.matryoshka_weights = matryoshka_weights
+        if self.matryoshka_dims is not None:
+            if any(d <= 0 for d in self.matryoshka_dims):
+                raise ValueError("Matryoshka dims must be positive")
+
+            if self.matryoshka_weights is not None and len(self.matryoshka_weights) != len(
+                self.matryoshka_dims
+            ):
+                raise ValueError("matryoshka_weights must match matryoshka_dims")
+
         if char_class_weights is not None:
             # Register for device transfers and checkpointing
             self.register_buffer("char_class_weights", char_class_weights.float())
         else:
             self.char_class_weights = None
         self.path_loss_fn = nn.MSELoss(reduction="none")
+
+    def _infonce_from_embeddings(
+        self,
+        emb: torch.Tensor,  # [N, d]
+        pair_ids: torch.Tensor,  # [N]
+        temperature: float,
+        gradient_mask: torch.Tensor | None,  # [N] 1=query, 0=key
+    ) -> torch.Tensor:
+        # Apply gradient masking: detach keys, keep queries
+        if gradient_mask is not None:
+            emb = torch.where(gradient_mask.unsqueeze(1).bool(), emb, emb.detach())
+        else:
+            emb = emb.detach()
+
+        emb = torch.nn.functional.normalize(emb, dim=-1)
+
+        sim = (emb @ emb.transpose(0, 1)) / temperature
+        sim = sim - torch.eye(sim.size(0), device=sim.device) * 1e9
+
+        pos_mask = pair_ids.unsqueeze(0) == pair_ids.unsqueeze(1)
+        pos_mask.fill_diagonal_(False)
+
+        if gradient_mask is not None:
+            query_indices = (gradient_mask == 1).nonzero(as_tuple=True)[0]
+        else:
+            query_indices = torch.arange(sim.size(0), device=sim.device)
+
+        if query_indices.numel() == 0:
+            return torch.tensor(0.0, device=sim.device)
+
+        query_pos_mask = pos_mask[query_indices]
+        has_positive = query_pos_mask.any(dim=1)
+        if not has_positive.any():
+            return torch.tensor(0.0, device=sim.device)
+
+        valid_query_indices = query_indices[has_positive]
+        valid_pos_mask = query_pos_mask[has_positive]
+
+        # first positive per query
+        first_pos_idx = valid_pos_mask.byte().argmax(dim=1)
+        pos_sims = sim[valid_query_indices, first_pos_idx]
+        logsumexp = torch.logsumexp(sim[valid_query_indices], dim=1)
+
+        return -(pos_sims - logsumexp).mean()
 
     def forward(
         self, outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]
@@ -126,85 +187,76 @@ class SwipeLoss(nn.Module):
         if "path_loss" in losses:
             total_loss = total_loss + self.path_weight * losses["path_loss"]
 
-        # Contrastive loss (pairwise views using SEP token embeddings)
+        # CLS length prediction (optional)
+        if (
+            self.length_weight > 0.0
+            and "length_logits" in outputs
+            and "length_target" in batch
+            and "length_supervise_mask" in batch
+        ):
+            length_logits = outputs["length_logits"]  # [batch, num_lengths]
+            length_target = batch["length_target"].long()  # [batch]
+            supervise_mask = batch["length_supervise_mask"].bool()  # [batch]
+            if supervise_mask.any():
+                ce = nn.CrossEntropyLoss(reduction="none")
+                length_loss_terms = ce(length_logits, length_target)
+                length_loss = length_loss_terms[supervise_mask].mean()
+            else:
+                length_loss = torch.tensor(0.0, device=length_logits.device)
+            losses["length_loss"] = length_loss
+            total_loss = total_loss + self.length_weight * length_loss
+
+        # Contrastive (Matryoshka-capable)
         if self.contrastive_weight > 0.0 and "pair_ids" in batch:
             hidden_states = outputs["hidden_states"]  # [N, seq_len, d]
             pair_ids = batch["pair_ids"]  # [N]
-            gradient_mask = batch.get("gradient_mask")  # [N] - 1 = query, 0 = key
+            gradient_mask = batch.get("gradient_mask")  # [N]
             path_len = batch["path_coords"].shape[1]
 
-            # Extract SEP token embeddings (position = 1 + path_len)
             sep_position = 1 + path_len
             sep_embeddings = hidden_states[:, sep_position, :]  # [N, d]
+            d = sep_embeddings.size(-1)
 
-            # Apply gradient masking: detach keys, keep queries
-            if gradient_mask is not None:
-                # Create masked embeddings: queries keep gradients, keys are detached
-                sep_embeddings_masked = torch.where(
-                    gradient_mask.unsqueeze(1).bool(), sep_embeddings, sep_embeddings.detach()
+            # Decide which dims to use
+            if self.matryoshka_dims is None:
+                dims = [d]  # original behavior
+            else:
+                dims = [int(x) for x in self.matryoshka_dims]
+                # keep valid, unique, sorted, and ensure full dim included if you want
+                dims = sorted({x for x in dims if 1 <= x <= d})
+                if len(dims) == 0:
+                    dims = [d]
+
+            # Weights
+            if self.matryoshka_weights is None:
+                weights = [1.0] * len(dims)
+            else:
+                if len(self.matryoshka_weights) != len(dims):
+                    raise ValueError("matryoshka_weights must match matryoshka_dims length")
+                weights = [float(w) for w in self.matryoshka_weights]
+
+            # Compute per-dim InfoNCE and combine
+            per_dim_losses = []
+            for dim in dims:
+                emb_d = sep_embeddings[:, :dim]
+                per_dim_losses.append(
+                    self._infonce_from_embeddings(
+                        emb=emb_d,
+                        pair_ids=pair_ids,
+                        temperature=self.contrastive_temperature,
+                        gradient_mask=gradient_mask,
+                    )
                 )
-            else:
-                # Fallback: detach all (conservative default)
-                sep_embeddings_masked = sep_embeddings.detach()
 
-            # Normalize after gradient masking
-            sep_embeddings_norm = torch.nn.functional.normalize(sep_embeddings_masked, dim=-1)
-
-            # For similarity computation, we want:
-            # - Queries (gradient_mask=1) to compute similarity to all
-            # - Keys provide targets but don't get gradients
-            # We use the normalized embeddings for both sides
-            sim = (
-                torch.matmul(sep_embeddings_norm, sep_embeddings_norm.transpose(0, 1))
-                / self.contrastive_temperature
+            wsum = sum(weights)
+            contrastive_loss = sum(w * L for w, L in zip(weights, per_dim_losses, strict=False)) / (
+                wsum if wsum > 0 else 1.0
             )
-
-            # Exclude self
-            sim = sim - torch.eye(sim.size(0), device=sim.device) * 1e9
-
-            # Positive mask (same pair_id, not self)
-            pos_mask = pair_ids.unsqueeze(0) == pair_ids.unsqueeze(1)
-            pos_mask.fill_diagonal_(False)
-
-            # Only compute loss for query samples (gradient_mask=1)
-            if gradient_mask is not None:
-                query_indices = (gradient_mask == 1).nonzero(as_tuple=True)[0]
-            else:
-                query_indices = torch.arange(sim.size(0), device=sim.device)
-
-            if query_indices.numel() > 0:
-                # Vectorized: get positive mask for queries [num_queries, N]
-                query_pos_mask = pos_mask[query_indices]
-
-                # Check which queries have at least one positive
-                has_positive = query_pos_mask.any(dim=1)
-
-                if has_positive.any():
-                    # Filter to queries with positives
-                    valid_query_indices = query_indices[has_positive]
-                    valid_pos_mask = query_pos_mask[has_positive]
-
-                    # For each query, get index of first positive
-                    first_pos_idx = valid_pos_mask.byte().argmax(dim=1)
-
-                    # Gather positive similarities
-                    pos_sims = sim[valid_query_indices, first_pos_idx]
-
-                    # Compute log-sum-exp for these queries
-                    logsumexp = torch.logsumexp(sim[valid_query_indices], dim=1)
-
-                    # InfoNCE loss: -log(exp(pos) / sum(exp(all)))
-                    contrastive_loss = -(pos_sims - logsumexp).mean()
-                else:
-                    contrastive_loss = torch.tensor(0.0, device=sim.device)
-            else:
-                contrastive_loss = torch.tensor(0.0, device=sim.device)
 
             losses["contrastive_loss"] = contrastive_loss
             total_loss = total_loss + self.contrastive_weight * contrastive_loss
 
         losses["total_loss"] = total_loss
-
         return losses
 
 
