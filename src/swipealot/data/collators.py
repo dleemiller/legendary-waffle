@@ -16,23 +16,43 @@ class MaskedCollator:
     def __init__(
         self,
         tokenizer: CharacterTokenizer,
-        char_mask_prob: float = 0.15,
+        char_mask_prob: float | tuple[float, float] = 0.15,
         path_mask_prob: float = 0.15,
         mask_path: bool = True,
+        mask_vocab_only: bool = False,
     ):
         """
         Initialize collator.
 
         Args:
             tokenizer: Character tokenizer for masking
-            char_mask_prob: Probability of masking each character
+            char_mask_prob: Probability of masking each character.
+                          Can be a float (fixed probability) or tuple (min, max)
+                          to randomly sample probability per batch from range.
             path_mask_prob: Probability of masking each path point
             mask_path: Whether to mask path points
+            mask_vocab_only: If True, only mask vocabulary tokens (a-z, 0-9),
+                           never mask special tokens ([EOS], [PUNC], [UNK])
         """
         self.tokenizer = tokenizer
         self.char_mask_prob = char_mask_prob
         self.path_mask_prob = path_mask_prob
         self.mask_path = mask_path
+        self.mask_vocab_only = mask_vocab_only
+
+        # Check if char_mask_prob is a range
+        if isinstance(char_mask_prob, (tuple, list)):
+            if len(char_mask_prob) != 2:
+                raise ValueError("char_mask_prob range must have exactly 2 values (min, max)")
+            self.char_mask_prob_min, self.char_mask_prob_max = char_mask_prob
+            self.use_random_mask_prob = True
+        else:
+            self.use_random_mask_prob = False
+
+        # Precompute vocabulary token range for efficiency
+        if self.mask_vocab_only:
+            self.vocab_start_id = len(tokenizer.special_tokens)  # 7
+            self.vocab_end_id = tokenizer.vocab_size  # 43
 
     def mask_characters(self, char_tokens: torch.Tensor, char_mask: torch.Tensor) -> tuple:
         """
@@ -51,9 +71,24 @@ class MaskedCollator:
         masked_tokens = char_tokens.clone()
         labels = torch.full_like(char_tokens, -100)  # -100 is ignored by CrossEntropyLoss
 
+        # Sample masking probability for this batch if using random range
+        if self.use_random_mask_prob:
+            import random
+
+            char_mask_prob = random.uniform(self.char_mask_prob_min, self.char_mask_prob_max)
+        else:
+            char_mask_prob = self.char_mask_prob
+
         # Vectorized masking: create random decisions for all tokens
-        mask_decisions = torch.rand(batch_size, seq_len) < self.char_mask_prob
+        mask_decisions = torch.rand(batch_size, seq_len) < char_mask_prob
         mask_decisions = mask_decisions & (char_mask == 1)  # Only mask valid tokens
+
+        # Filter to vocabulary tokens only if mask_vocab_only=True
+        if self.mask_vocab_only:
+            is_vocab_token = (char_tokens >= self.vocab_start_id) & (
+                char_tokens < self.vocab_end_id
+            )
+            mask_decisions = mask_decisions & is_vocab_token
 
         # For tokens we decided to mask, store original as label
         labels[mask_decisions] = char_tokens[mask_decisions]
@@ -447,28 +482,31 @@ class ValidationCollator:
         self.tokenizer = tokenizer
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        # Stack tensors without any masking
+        # Stack tensors
         path_coords = torch.stack([item["path_coords"] for item in batch])
         char_tokens = torch.stack([item["char_tokens"] for item in batch])
         path_mask = torch.stack([item["path_mask"] for item in batch])
         char_mask = torch.stack([item["char_mask"] for item in batch])
 
-        # Create labels for all valid (non-padding) positions (vectorized)
-        # We want to evaluate prediction on all real tokens (excluding PAD)
         batch_size = char_tokens.shape[0]
+
+        # Save true labels before masking
         char_labels = char_tokens.clone()
+        char_labels[char_mask == 0] = -100  # Ignore padding in loss
 
-        # Set padding positions to -100 (ignore in loss)
-        char_labels[char_mask == 0] = -100
+        # Mask all character tokens (BERT-style: mask input but allow attention)
+        masked_char_tokens = char_tokens.clone()
+        masked_char_tokens[char_mask == 1] = self.tokenizer.mask_token_id
 
-        # Create attention mask: [CLS] + path + [SEP] + chars
+        # Create attention mask: [CLS] + path + [SEP] + chars (WITH attention)
+        # This allows model to use positional info while predicting masked tokens
         cls_mask = torch.ones(batch_size, 1, dtype=torch.long)
         sep_mask = torch.ones(batch_size, 1, dtype=torch.long)
         attention_mask = torch.cat([cls_mask, path_mask, sep_mask, char_mask], dim=1)
 
         return {
             "path_coords": path_coords,
-            "char_tokens": char_tokens,
+            "char_tokens": masked_char_tokens,  # Use masked tokens for input
             "char_labels": char_labels,
             "path_mask": path_mask,
             "char_mask": char_mask,

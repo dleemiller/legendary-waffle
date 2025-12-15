@@ -74,6 +74,7 @@ class SwipeTrainer:
         os.makedirs(train_config.log_dir, exist_ok=True)
         self.writer = SummaryWriter(log_dir=train_config.log_dir)
         self.global_step = 0
+        self.best_accuracy: float | None = None
 
         # Checkpointing with Lightning ModelCheckpoint
         os.makedirs(train_config.checkpoint_dir, exist_ok=True)
@@ -224,8 +225,6 @@ class SwipeTrainer:
             self.word_accuracy.reset()
         eval_losses = []
         eval_loss_terms = {}
-        eval_loss_terms = {}
-        eval_loss_terms = {}
 
         with torch.no_grad():
             for batch in self.val_loader:
@@ -242,10 +241,6 @@ class SwipeTrainer:
 
                 losses = self.loss_fn(outputs, batch)
                 eval_losses.append(losses["total_loss"].item())
-                for k, v in losses.items():
-                    eval_loss_terms[k] = eval_loss_terms.get(k, 0.0) + float(v.item())
-                for k, v in losses.items():
-                    eval_loss_terms[k] = eval_loss_terms.get(k, 0.0) + float(v.item())
                 for k, v in losses.items():
                     eval_loss_terms[k] = eval_loss_terms.get(k, 0.0) + float(v.item())
 
@@ -394,17 +389,18 @@ class SwipeTrainer:
         torch.save(checkpoint, path)
         print(f"Saved checkpoint: {path}")
 
-    def train(self, num_epochs: int):
+    def train(self, num_epochs: int, start_epoch: int = 0):
         """
         Main training loop.
 
         Args:
             num_epochs: Number of epochs to train
         """
-        # Initialize best_accuracy for step-based validation
-        self.best_accuracy = 0.0
+        # Initialize best_accuracy for step-based validation (allow resume override)
+        if self.best_accuracy is None:
+            self.best_accuracy = 0.0
 
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             print(f"\n{'=' * 60}")
             print(f"Epoch {epoch + 1}/{num_epochs}")
             print(f"{'=' * 60}")

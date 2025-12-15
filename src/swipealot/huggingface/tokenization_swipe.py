@@ -46,13 +46,27 @@ class SwipeTokenizer(PreTrainedTokenizer):
             with open(vocab_file, encoding="utf-8") as f:
                 vocab_data = json.load(f)
 
-            # Extract vocabulary (excluding special tokens)
+            # Extract vocabulary (excluding ALL special tokens)
+            # All special tokens that should NOT be passed to CharacterTokenizer
+            # Convert AddedToken objects to strings
+            special_tokens_to_exclude = {
+                str(pad_token),
+                str(cls_token),
+                str(sep_token),
+                str(mask_token),
+                str(unk_token),
+                str(eos_token),
+                "[PUNC]",
+            }
+
             if "chars" in vocab_data:
-                vocab = set(vocab_data["chars"])
+                # Filter out special tokens from the chars list
+                vocab = set(c for c in vocab_data["chars"] if c not in special_tokens_to_exclude)
             elif "char_to_id" in vocab_data:
                 # Get all characters except special tokens
-                special_tokens = [pad_token, cls_token, sep_token, mask_token, unk_token, eos_token]
-                vocab = set(c for c in vocab_data["char_to_id"].keys() if c not in special_tokens)
+                vocab = set(
+                    c for c in vocab_data["char_to_id"].keys() if c not in special_tokens_to_exclude
+                )
             else:
                 vocab = None
 
