@@ -1,6 +1,7 @@
 """Configuration dataclasses for the swipe keyboard model."""
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from omegaconf import OmegaConf
 
@@ -25,6 +26,7 @@ class ModelConfig:
 
     # Tasks
     predict_path: bool = True
+    predict_length: bool = True  # Auxiliary CLS head to predict swipable length
 
 
 @dataclass
@@ -42,9 +44,10 @@ class DataConfig:
     max_char_len: int = 38
 
     # Masking strategy
-    char_mask_prob: float = 0.15
+    char_mask_prob: Any = 0.15  # Float or [min, max] range for random masking
     path_mask_prob: float = 0.15
     mask_path: bool = True
+    mask_vocab_only: bool = False  # Only mask vocabulary tokens (a-z, 0-9)
 
     # DataLoader
     batch_size: int = 512
@@ -65,6 +68,7 @@ class TrainingConfig:
     # Loss weights
     char_loss_weight: float = 1.0
     path_loss_weight: float = 0.1
+    length_loss_weight: float = 0.1  # Auxiliary CLS length prediction
 
     # Logging and checkpointing
     log_interval: int = 100
@@ -85,14 +89,20 @@ class TrainingConfig:
     use_focal_loss: bool = False
     focal_gamma: float = 0.0
     use_char_freq_weights: bool = False
-    char_freq_max_samples: int = 100000
     char_weights_path: str | None = None
 
     # Pairwise masking + contrastive objective
     use_pairwise_masking: bool = False
     pairwise_modality_prob: float = 0.2  # Probability of using modality-based masking (vs inverted)
+    pairwise_zero_text_attention_prob: float = (
+        0.5  # Probability of zeroing text attention (for length-only training)
+    )
     contrastive_weight: float = 0.0
     contrastive_temperature: float = 0.1
+
+    # matryoshka settings
+    matryoshka_dims: list[int] | None = None
+    matryoshka_weights: list[float] | None = None
 
 
 @dataclass

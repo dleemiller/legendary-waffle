@@ -4,7 +4,6 @@ import os
 
 import torch
 import torch.nn as nn
-from lightning.pytorch.callbacks import ModelCheckpoint
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -59,15 +58,6 @@ class CrossEncoderTrainer:
 
         # Checkpointing
         os.makedirs(self.train_config.checkpoint_dir, exist_ok=True)
-        self.checkpoint_callback = ModelCheckpoint(
-            dirpath=self.train_config.checkpoint_dir,
-            filename="checkpoint_epoch_{epoch}",
-            save_top_k=self.train_config.keep_n_checkpoints,
-            monitor="val_accuracy",
-            mode="max",
-            save_last=True,
-            verbose=True,
-        )
 
         # Mixed precision
         self.amp_dtype = None

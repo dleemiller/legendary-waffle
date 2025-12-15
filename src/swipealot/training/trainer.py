@@ -74,6 +74,7 @@ class SwipeTrainer:
         os.makedirs(train_config.log_dir, exist_ok=True)
         self.writer = SummaryWriter(log_dir=train_config.log_dir)
         self.global_step = 0
+        self.best_accuracy: float | None = None
 
         # Checkpointing with Lightning ModelCheckpoint
         os.makedirs(train_config.checkpoint_dir, exist_ok=True)
@@ -184,13 +185,22 @@ class SwipeTrainer:
                 print(f"\n[Step {self.global_step}] Running validation...")
                 val_metrics = self.evaluate_step(self.global_step)
 
-                # Save best checkpoint
-                current_accuracy = val_metrics["char_accuracy"]
-                if not hasattr(self, "best_accuracy"):
-                    self.best_accuracy = 0.0
+                # after val_metrics computed
+                current_accuracy = float(val_metrics["char_accuracy"])
+
+                # Always save a step checkpoint (optional)
+                step_path = (
+                    Path(self.train_config.checkpoint_dir)
+                    / f"checkpoint_step_{self.global_step}.pt"
+                )
+                self.save_checkpoint(str(step_path), epoch, val_metrics)
+
+                # Save best
                 if current_accuracy > self.best_accuracy:
                     self.best_accuracy = current_accuracy
-                    self.save_checkpoint(epoch, val_metrics)
+                    best_path = Path(self.train_config.checkpoint_dir) / "best.pt"
+                    self.save_checkpoint(str(best_path), epoch, val_metrics)
+                    print(f"New best model saved! char_accuracy={current_accuracy:.4f}")
 
                 # Return to training mode
                 self.model.train()
@@ -214,6 +224,7 @@ class SwipeTrainer:
         if self.word_accuracy:
             self.word_accuracy.reset()
         eval_losses = []
+        eval_loss_terms = {}
 
         with torch.no_grad():
             for batch in self.val_loader:
@@ -230,6 +241,8 @@ class SwipeTrainer:
 
                 losses = self.loss_fn(outputs, batch)
                 eval_losses.append(losses["total_loss"].item())
+                for k, v in losses.items():
+                    eval_loss_terms[k] = eval_loss_terms.get(k, 0.0) + float(v.item())
 
                 # Extract character predictions
                 char_logits = outputs["char_logits"]
@@ -254,11 +267,19 @@ class SwipeTrainer:
             word_acc = self.word_accuracy.compute()
             metrics["word_accuracy"] = word_acc
 
+        # Add averaged loss components for logging
+        num_batches = len(eval_losses)
+        for k, v in eval_loss_terms.items():
+            metrics[f"{k}_mean"] = v / num_batches if num_batches > 0 else 0.0
+
         # Log to TensorBoard
         self.writer.add_scalar("eval/loss", avg_loss, step)
         self.writer.add_scalar("eval/char_accuracy", char_acc, step)
         if self.word_accuracy:
             self.writer.add_scalar("eval/word_accuracy", word_acc, step)
+        for k, v in metrics.items():
+            if k.startswith("loss_") or k.endswith("_loss") or k.endswith("_mean"):
+                self.writer.add_scalar(f"eval/{k}", v, step)
 
         # Print metrics
         print(f"Val - Loss: {avg_loss:.4f}, Char Accuracy: {char_acc:.4f}", end="")
@@ -284,6 +305,7 @@ class SwipeTrainer:
         if self.word_accuracy:
             self.word_accuracy.reset()
         eval_losses = []
+        eval_loss_terms = {}
 
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Evaluating"):
@@ -297,6 +319,8 @@ class SwipeTrainer:
 
                 losses = self.loss_fn(outputs, batch)
                 eval_losses.append(losses["total_loss"].item())
+                for k, v in losses.items():
+                    eval_loss_terms[k] = eval_loss_terms.get(k, 0.0) + float(v.item())
 
                 # Extract character predictions
                 char_logits = outputs["char_logits"]
@@ -321,11 +345,19 @@ class SwipeTrainer:
             word_acc = self.word_accuracy.compute()
             metrics["word_accuracy"] = word_acc
 
+        # Add averaged loss components for logging
+        num_batches = len(eval_losses)
+        for k, v in eval_loss_terms.items():
+            metrics[f"{k}_mean"] = v / num_batches if num_batches > 0 else 0.0
+
         # Log to TensorBoard (use global_step for proper alignment with training metrics)
         self.writer.add_scalar("eval/loss", avg_loss, self.global_step)
         self.writer.add_scalar("eval/char_accuracy", char_acc, self.global_step)
         if self.word_accuracy:
             self.writer.add_scalar("eval/word_accuracy", word_acc, self.global_step)
+        for k, v in metrics.items():
+            if k.startswith("loss_") or k.endswith("_loss") or k.endswith("_mean"):
+                self.writer.add_scalar(f"eval/{k}", v, self.global_step)
 
         # Print metrics
         print(
@@ -339,15 +371,8 @@ class SwipeTrainer:
 
         return metrics
 
-    def save_checkpoint(self, epoch: int, metrics: dict[str, float]):
-        """
-        Save model checkpoint using Lightning ModelCheckpoint.
-
-        Args:
-            epoch: Current epoch
-            metrics: Evaluation metrics (must include 'char_accuracy' for monitoring)
-        """
-        # Create checkpoint dict
+    def save_checkpoint(self, path: str, epoch: int, metrics: dict[str, float]):
+        """Save model checkpoint (manual torch.save, no Lightning)."""
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
@@ -356,37 +381,26 @@ class SwipeTrainer:
             "config": self.config,
             "global_step": self.global_step,
         }
-
         if self.scheduler:
             checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
-
         if self.scaler:
             checkpoint["scaler_state_dict"] = self.scaler.state_dict()
 
-        # Save using Lightning callback (handles cleanup automatically)
-        filepath = Path(self.train_config.checkpoint_dir) / f"checkpoint_epoch_{epoch + 1}.pt"
-        torch.save(checkpoint, filepath)
+        torch.save(checkpoint, path)
+        print(f"Saved checkpoint: {path}")
 
-        # Update callback's best model tracking
-        if "char_accuracy" in metrics:
-            current_score = metrics["char_accuracy"]
-            self.checkpoint_callback.update_best_and_save(
-                current_score, trainer=None, pl_module=None
-            )
-
-        print(f"Saved checkpoint: {filepath}")
-
-    def train(self, num_epochs: int):
+    def train(self, num_epochs: int, start_epoch: int = 0):
         """
         Main training loop.
 
         Args:
             num_epochs: Number of epochs to train
         """
-        # Initialize best_accuracy for step-based validation
-        self.best_accuracy = 0.0
+        # Initialize best_accuracy for step-based validation (allow resume override)
+        if self.best_accuracy is None:
+            self.best_accuracy = 0.0
 
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             print(f"\n{'=' * 60}")
             print(f"Epoch {epoch + 1}/{num_epochs}")
             print(f"{'=' * 60}")
@@ -399,9 +413,18 @@ class SwipeTrainer:
             print(f"\n[Epoch {epoch + 1}] Running end-of-epoch validation...")
             eval_metrics = self.evaluate(epoch)
 
-            # Save epoch checkpoint (Lightning callback handles cleanup automatically)
             if (epoch + 1) % self.train_config.save_interval == 0:
-                self.save_checkpoint(epoch, eval_metrics)
+                epoch_path = (
+                    Path(self.train_config.checkpoint_dir) / f"checkpoint_epoch_{epoch + 1}.pt"
+                )
+                self.save_checkpoint(str(epoch_path), epoch, eval_metrics)
+
+                current_accuracy = float(eval_metrics["char_accuracy"])
+                if current_accuracy > self.best_accuracy:
+                    self.best_accuracy = current_accuracy
+                    best_path = Path(self.train_config.checkpoint_dir) / "best.pt"
+                    self.save_checkpoint(str(best_path), epoch, eval_metrics)
+                    print(f"New best model saved! char_accuracy={current_accuracy:.4f}")
 
         self.writer.close()
         print(f"\nTraining complete! Best character accuracy: {self.best_accuracy:.4f}")

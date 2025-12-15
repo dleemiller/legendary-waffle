@@ -9,6 +9,7 @@ dependencies = []
 [project.scripts]
 train = "swipealot.scripts.train:main"
 evaluate = "swipealot.scripts.evaluate:main"
+attention-map = "swipealot.scripts.attention_map:main"
 
 [project.optional-dependencies]
 cu128 = [

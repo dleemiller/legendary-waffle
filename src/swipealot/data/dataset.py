@@ -134,13 +134,8 @@ class SwipeDataset(Dataset):
             self.dataset = load_dataset(dataset_name, split=split)
         print(f"Loaded {len(self.dataset)} samples")
 
-        # Initialize tokenizer
-        if tokenizer is None:
-            print("Building tokenizer from dataset...")
-            self.tokenizer = CharacterTokenizer.from_dataset(self.dataset)
-            print(f"Vocabulary size: {self.tokenizer.vocab_size}")
-        else:
-            self.tokenizer = tokenizer
+        # Initialize tokenizer (deterministic; no dataset-derived vocab)
+        self.tokenizer = tokenizer if tokenizer is not None else CharacterTokenizer()
 
     def __len__(self) -> int:
         return len(self.dataset)

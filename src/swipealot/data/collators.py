@@ -16,23 +16,43 @@ class MaskedCollator:
     def __init__(
         self,
         tokenizer: CharacterTokenizer,
-        char_mask_prob: float = 0.15,
+        char_mask_prob: float | tuple[float, float] = 0.15,
         path_mask_prob: float = 0.15,
         mask_path: bool = True,
+        mask_vocab_only: bool = False,
     ):
         """
         Initialize collator.
 
         Args:
             tokenizer: Character tokenizer for masking
-            char_mask_prob: Probability of masking each character
+            char_mask_prob: Probability of masking each character.
+                          Can be a float (fixed probability) or tuple (min, max)
+                          to randomly sample probability per batch from range.
             path_mask_prob: Probability of masking each path point
             mask_path: Whether to mask path points
+            mask_vocab_only: If True, only mask vocabulary tokens (a-z, 0-9),
+                           never mask special tokens ([EOS], [PUNC], [UNK])
         """
         self.tokenizer = tokenizer
         self.char_mask_prob = char_mask_prob
         self.path_mask_prob = path_mask_prob
         self.mask_path = mask_path
+        self.mask_vocab_only = mask_vocab_only
+
+        # Check if char_mask_prob is a range
+        if isinstance(char_mask_prob, (tuple, list)):
+            if len(char_mask_prob) != 2:
+                raise ValueError("char_mask_prob range must have exactly 2 values (min, max)")
+            self.char_mask_prob_min, self.char_mask_prob_max = char_mask_prob
+            self.use_random_mask_prob = True
+        else:
+            self.use_random_mask_prob = False
+
+        # Precompute vocabulary token range for efficiency
+        if self.mask_vocab_only:
+            self.vocab_start_id = len(tokenizer.special_tokens)  # 7
+            self.vocab_end_id = tokenizer.vocab_size  # 43
 
     def mask_characters(self, char_tokens: torch.Tensor, char_mask: torch.Tensor) -> tuple:
         """
@@ -51,9 +71,24 @@ class MaskedCollator:
         masked_tokens = char_tokens.clone()
         labels = torch.full_like(char_tokens, -100)  # -100 is ignored by CrossEntropyLoss
 
+        # Sample masking probability for this batch if using random range
+        if self.use_random_mask_prob:
+            import random
+
+            char_mask_prob = random.uniform(self.char_mask_prob_min, self.char_mask_prob_max)
+        else:
+            char_mask_prob = self.char_mask_prob
+
         # Vectorized masking: create random decisions for all tokens
-        mask_decisions = torch.rand(batch_size, seq_len) < self.char_mask_prob
+        mask_decisions = torch.rand(batch_size, seq_len) < char_mask_prob
         mask_decisions = mask_decisions & (char_mask == 1)  # Only mask valid tokens
+
+        # Filter to vocabulary tokens only if mask_vocab_only=True
+        if self.mask_vocab_only:
+            is_vocab_token = (char_tokens >= self.vocab_start_id) & (
+                char_tokens < self.vocab_end_id
+            )
+            mask_decisions = mask_decisions & is_vocab_token
 
         # For tokens we decided to mask, store original as label
         labels[mask_decisions] = char_tokens[mask_decisions]
@@ -183,17 +218,26 @@ class PairwiseMaskedCollator:
     """
 
     def __init__(
-        self, tokenizer: CharacterTokenizer, mask_path: bool = True, modality_prob: float = 0.2
+        self,
+        tokenizer: CharacterTokenizer,
+        mask_path: bool = True,
+        modality_prob: float = 0.2,
+        zero_text_attention_prob: float = 0.5,
     ):
         """
         Args:
             tokenizer: Character tokenizer
             mask_path: Whether to mask path coordinates
             modality_prob: Probability of using modality-based masking (vs inverted)
+            zero_text_attention_prob: Probability of fully zeroing text attention in
+                the text-masked view to teach path-only embeddings (simulates inference
+                when text length is unknown)
         """
         self.tokenizer = tokenizer
         self.mask_path = mask_path
         self.modality_prob = modality_prob
+        self.zero_text_attention_prob = zero_text_attention_prob
+        self.max_char_len = None  # derived per-sample
 
     def _create_inverted_masks(
         self, path_coords, path_mask, char_tokens, char_mask, heavy_aug: bool
@@ -301,6 +345,12 @@ class PairwiseMaskedCollator:
         views_path_mask_indices = []
         pair_ids = []
         gradient_mask = []  # 1 = gets gradients (query), 0 = detached (key)
+        length_targets = []
+        length_supervise_mask = []
+
+        def _swipable_length(word: str, max_len: int) -> int:
+            length = sum(1 for c in word.lower() if c.isalpha() or c.isdigit())
+            return min(length, max_len)
 
         for pair_id, item in enumerate(batch):
             path_coords = item["path_coords"]
@@ -345,16 +395,41 @@ class PairwiseMaskedCollator:
             masked_path_a = self._apply_path_mask(path_coords, path_mask_a)
             masked_char_a, labels_a = self._apply_char_mask(char_tokens, char_mask_a)
 
+            # Optionally zero out text attention for the text-masked view to remove
+            # length information (simulates path-only inference when text is unknown).
+            # We only do this when text is the modality being masked (char_mask_a all 1s
+            # and path is visible).
+            use_zero_text_attn = (
+                use_modality_mode
+                and self.zero_text_attention_prob > 0.0
+                and random.random() < self.zero_text_attention_prob
+            )
+            if use_zero_text_attn:
+                # No attention to text positions; also drop char loss for this view.
+                attn_mask_a = torch.cat(
+                    [cls_mask, path_mask, sep_mask, torch.zeros_like(char_mask)], dim=0
+                )
+                masked_char_a = torch.full_like(char_tokens, self.tokenizer.pad_token_id)
+                labels_a = torch.full_like(char_tokens, -100)
+                char_mask_view_a = torch.zeros_like(char_mask)
+                length_supervise = 1
+            else:
+                attn_mask_a = attn_base
+                char_mask_view_a = char_mask
+                length_supervise = 0
+
             views_paths.append(masked_path_a)
             views_tokens.append(masked_char_a)
             views_labels.append(labels_a)
-            views_attention.append(attn_base)
-            views_char_mask.append(char_mask)
+            views_attention.append(attn_mask_a)
+            views_char_mask.append(char_mask_view_a)
             views_path_mask.append(path_mask)
             views_path_labels.append(path_coords)
             views_path_mask_indices.append(path_mask_a)
             pair_ids.append(pair_id)
             gradient_mask.append(gradient_a)
+            length_targets.append(_swipable_length(item["word"], char_tokens.shape[0]))
+            length_supervise_mask.append(length_supervise)
 
             # Create View B (key)
             masked_path_b = self._apply_path_mask(path_coords, path_mask_b)
@@ -370,6 +445,8 @@ class PairwiseMaskedCollator:
             views_path_mask_indices.append(path_mask_b)
             pair_ids.append(pair_id)
             gradient_mask.append(gradient_b)
+            length_targets.append(_swipable_length(item["word"], char_tokens.shape[0]))
+            length_supervise_mask.append(0)  # never supervise on key
 
         result = {
             "path_coords": torch.stack(views_paths),
@@ -387,6 +464,9 @@ class PairwiseMaskedCollator:
             result["path_labels"] = torch.stack(views_path_labels)
             result["path_mask_indices"] = torch.stack(views_path_mask_indices)
 
+        result["length_target"] = torch.tensor(length_targets, dtype=torch.long)
+        result["length_supervise_mask"] = torch.tensor(length_supervise_mask, dtype=torch.long)
+
         return result
 
 
@@ -402,28 +482,31 @@ class ValidationCollator:
         self.tokenizer = tokenizer
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        # Stack tensors without any masking
+        # Stack tensors
         path_coords = torch.stack([item["path_coords"] for item in batch])
         char_tokens = torch.stack([item["char_tokens"] for item in batch])
         path_mask = torch.stack([item["path_mask"] for item in batch])
         char_mask = torch.stack([item["char_mask"] for item in batch])
 
-        # Create labels for all valid (non-padding) positions (vectorized)
-        # We want to evaluate prediction on all real tokens (excluding PAD)
         batch_size = char_tokens.shape[0]
+
+        # Save true labels before masking
         char_labels = char_tokens.clone()
+        char_labels[char_mask == 0] = -100  # Ignore padding in loss
 
-        # Set padding positions to -100 (ignore in loss)
-        char_labels[char_mask == 0] = -100
+        # Mask all character tokens (BERT-style: mask input but allow attention)
+        masked_char_tokens = char_tokens.clone()
+        masked_char_tokens[char_mask == 1] = self.tokenizer.mask_token_id
 
-        # Create attention mask: [CLS] + path + [SEP] + chars
+        # Create attention mask: [CLS] + path + [SEP] + chars (WITH attention)
+        # This allows model to use positional info while predicting masked tokens
         cls_mask = torch.ones(batch_size, 1, dtype=torch.long)
         sep_mask = torch.ones(batch_size, 1, dtype=torch.long)
         attention_mask = torch.cat([cls_mask, path_mask, sep_mask, char_mask], dim=1)
 
         return {
             "path_coords": path_coords,
-            "char_tokens": char_tokens,
+            "char_tokens": masked_char_tokens,  # Use masked tokens for input
             "char_labels": char_labels,
             "path_mask": path_mask,
             "char_mask": char_mask,

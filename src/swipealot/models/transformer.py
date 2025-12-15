@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from .embeddings import MixedEmbedding
-from .heads import CharacterPredictionHead, PathPredictionHead
+from .heads import CharacterPredictionHead, LengthPredictionHead, PathPredictionHead
 
 
 class SwipeTransformerModel(nn.Module):
@@ -43,6 +43,11 @@ class SwipeTransformerModel(nn.Module):
 
         # Prediction heads
         self.char_head = CharacterPredictionHead(config.d_model, config.vocab_size)
+        self.length_head = (
+            LengthPredictionHead(config.d_model, max_length=config.max_char_len)
+            if getattr(config, "predict_length", False)
+            else None
+        )
 
         if config.predict_path:
             self.path_head = PathPredictionHead(config.d_model)
@@ -126,5 +131,10 @@ class SwipeTransformerModel(nn.Module):
         if self.path_head is not None:
             path_coords_pred = self.path_head(hidden_states)
             outputs["path_coords_pred"] = path_coords_pred
+
+        if self.length_head is not None:
+            cls_states = hidden_states[:, 0, :]  # CLS position
+            length_logits = self.length_head(cls_states)
+            outputs["length_logits"] = length_logits
 
         return outputs

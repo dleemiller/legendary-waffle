@@ -12,7 +12,6 @@ from swipealot.data import (
     PairwiseMaskedCollator,
     SwipeDataset,
     ValidationCollator,
-    compute_char_frequency_weights,
     vocab_hash,
 )
 from swipealot.models import SwipeTransformerModel
@@ -26,6 +25,12 @@ def main():
     )
     parser.add_argument(
         "--resume", type=str, default=None, help="Path to checkpoint to resume from"
+    )
+    parser.add_argument(
+        "--load-weights",
+        type=str,
+        default=None,
+        help="Path to checkpoint to load weights from (for fine-tuning, starts fresh training)",
     )
     parser.add_argument(
         "--debug", action="store_true", help="Use small subset of data for debugging"
@@ -72,10 +77,16 @@ def main():
     config.model.vocab_size = tokenizer.vocab_size
     print(f"Vocabulary size: {tokenizer.vocab_size}")
 
-    # Optional inverse-log character frequency weights
+    # Optional inverse-log character frequency weights (pre-computed only)
     char_freq_weights = None
-    weights_path = args.char_weights or config.training.char_weights_path
-    if weights_path:
+    if config.training.use_char_freq_weights:
+        weights_path = args.char_weights or config.training.char_weights_path
+        if not weights_path:
+            raise ValueError(
+                "use_char_freq_weights is True but no char_weights_path provided. "
+                "Run scripts/compute_char_weights.py first."
+            )
+
         print(f"\nLoading precomputed character weights from: {weights_path}")
         loaded = torch.load(weights_path, map_location=device, weights_only=False)
         if isinstance(loaded, dict) and "weights" in loaded:
@@ -106,13 +117,8 @@ def main():
         print(
             f"Loaded weights tensor shape: {tuple(char_freq_weights.shape)} (mean {char_freq_weights.mean():.4f})"
         )
-    elif config.training.use_char_freq_weights:
-        print("\nComputing character frequency weights...")
-        char_freq_weights = compute_char_frequency_weights(
-            tokenizer, sample_dataset.dataset, max_samples=config.training.char_freq_max_samples
-        )
-        char_freq_weights = char_freq_weights.to(device)
-        print(f"Computed weights for {len(char_freq_weights)} tokens (mean normalized)")
+    else:
+        print("\nCharacter frequency weights: disabled (use_char_freq_weights=False)")
 
     # Create datasets
     print("\nLoading datasets...")
@@ -143,6 +149,7 @@ def main():
             tokenizer=tokenizer,
             mask_path=config.data.mask_path,
             modality_prob=config.training.pairwise_modality_prob,
+            zero_text_attention_prob=config.training.pairwise_zero_text_attention_prob,
         )
         # Use unmasked validation for true accuracy metrics
         val_collator = ValidationCollator(tokenizer=tokenizer)
@@ -158,6 +165,7 @@ def main():
             char_mask_prob=config.data.char_mask_prob,
             path_mask_prob=config.data.path_mask_prob,
             mask_path=config.data.mask_path,
+            mask_vocab_only=config.data.mask_vocab_only,
         )
         val_collator = train_collator
 
@@ -228,6 +236,15 @@ def main():
 
     # Resume from checkpoint if specified
     start_epoch = 0
+    resume_metrics = None
+    resume_global_step = None
+    resume_scaler_state = None
+
+    if args.resume and args.load_weights:
+        raise ValueError(
+            "Cannot specify both --resume and --load-weights. Use --resume to continue training, or --load-weights for fine-tuning."
+        )
+
     if args.resume:
         print(f"\nLoading checkpoint from: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
@@ -235,17 +252,40 @@ def main():
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        resume_metrics = checkpoint.get("metrics")
+        resume_global_step = checkpoint.get("global_step")
+        resume_scaler_state = checkpoint.get("scaler_state_dict")
         start_epoch = checkpoint.get("epoch", 0) + 1
         print(f"Resuming from epoch {start_epoch}")
+
+    elif args.load_weights:
+        print(f"\nLoading model weights for fine-tuning from: {args.load_weights}")
+        checkpoint = torch.load(args.load_weights, map_location=device, weights_only=False)
+        # Use strict=False to allow loading when model architecture differs (e.g., missing heads)
+        missing_keys, unexpected_keys = model.load_state_dict(
+            checkpoint["model_state_dict"], strict=False
+        )
+        if unexpected_keys:
+            print(
+                f"Ignored {len(unexpected_keys)} unexpected keys (likely disabled heads): {unexpected_keys[:3]}..."
+            )
+        if missing_keys:
+            print(f"Warning: {len(missing_keys)} missing keys: {missing_keys[:3]}...")
+        print(
+            "Loaded pretrained weights. Starting fresh training from epoch 0 with new optimizer/scheduler."
+        )
 
     # Create loss function
     loss_fn = SwipeLoss(
         char_weight=config.training.char_loss_weight,
         path_weight=config.training.path_loss_weight,
+        length_weight=config.training.length_loss_weight,
         focal_gamma=config.training.focal_gamma if config.training.use_focal_loss else 0.0,
         char_class_weights=char_freq_weights,
         contrastive_weight=config.training.contrastive_weight,
         contrastive_temperature=config.training.contrastive_temperature,
+        matryoshka_dims=config.training.matryoshka_dims,
+        matryoshka_weights=config.training.matryoshka_weights,
     )
 
     # Create trainer
@@ -262,10 +302,19 @@ def main():
         tokenizer=tokenizer,
     )
 
+    # Restore trainer state (global step, scaler, best accuracy) when resuming
+    if args.resume:
+        if resume_global_step is not None:
+            trainer.global_step = resume_global_step
+        if resume_metrics and "char_accuracy" in resume_metrics:
+            trainer.best_accuracy = float(resume_metrics["char_accuracy"])
+        if trainer.scaler and resume_scaler_state is not None:
+            trainer.scaler.load_state_dict(resume_scaler_state)
+
     # Train
     print("\nStarting training...")
     print("=" * 60)
-    trainer.train(num_epochs=config.training.num_epochs)
+    trainer.train(num_epochs=config.training.num_epochs, start_epoch=start_epoch)
 
 
 if __name__ == "__main__":
