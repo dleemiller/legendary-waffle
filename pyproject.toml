@@ -10,6 +10,8 @@ dependencies = []
 train = "swipealot.scripts.train:main"
 evaluate = "swipealot.scripts.evaluate:main"
 attention-map = "swipealot.scripts.attention_map:main"
+convert-hf = "swipealot.scripts.convert_hf:main"
+test-hf = "swipealot.scripts.test_hf:main"
 
 [project.optional-dependencies]
 cu128 = [

@@ -300,7 +300,7 @@ class SwipeCrossEncoder:
             # Get hidden states from the encoder
             embeddings_input = self.model.embeddings(
                 inputs["path_coords"],
-                inputs["char_tokens"],
+                inputs["input_ids"],
                 torch.full(
                     (inputs["path_coords"].shape[0], 1),
                     fill_value=self.model.config.cls_token_id,

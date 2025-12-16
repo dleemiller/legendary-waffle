@@ -141,7 +141,7 @@ class SwipeTokenizer(PreTrainedTokenizer):
         Returns:
             str: Concatenated string
         """
-        # Filter out special tokens
+        # Filter out special tokens (must include [PUNC] which represents punctuation)
         special_tokens = {
             self.pad_token,
             self.cls_token,
@@ -149,6 +149,7 @@ class SwipeTokenizer(PreTrainedTokenizer):
             self.mask_token,
             self.unk_token,
             self.eos_token,
+            "[PUNC]",  # Punctuation token from CharacterTokenizer
         }
         filtered = [t for t in tokens if t not in special_tokens]
         return "".join(filtered)

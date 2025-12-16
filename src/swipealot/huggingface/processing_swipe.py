@@ -57,7 +57,7 @@ class SwipeProcessor(ProcessorMixin):
         Returns:
             Dictionary with:
                 - path_coords: [batch, max_path_len, 3] (if path_coords provided)
-                - char_tokens: [batch, max_char_len] (if text provided)
+                - input_ids: [batch, max_char_len] (if text provided)
                 - attention_mask: [batch, total_seq_len]
         """
         if path_coords is None and text is None:
@@ -111,9 +111,11 @@ class SwipeProcessor(ProcessorMixin):
                 path_coords = torch.cat([path_coords, torch.zeros(batch_size, pad_len, 3)], dim=1)
 
             # Create path mask (1 = real data, 0 = padding)
+            # Detect padding by checking for all-zero coordinates
             path_mask = torch.ones(batch_size, self.max_path_len, dtype=torch.long)
-            if padding and current_path_len < self.max_path_len:
-                path_mask[:, current_path_len:] = 0
+            # A point is padding if all its coordinates (x, y, t) are zero
+            is_padding = (path_coords == 0).all(dim=-1)  # [batch, path_len]
+            path_mask[is_padding] = 0
 
             result["path_coords"] = path_coords
             # Store path_mask internally for attention_mask construction
@@ -133,19 +135,55 @@ class SwipeProcessor(ProcessorMixin):
             # Tokenize text
             text_max_length = max_length if max_length is not None else self.max_char_len
 
-            encoded = self.tokenizer(
+            # First tokenize without padding/truncation to add EOS
+            encoded_raw = self.tokenizer(
                 text,
-                padding="max_length" if padding else False,
-                truncation=truncation,
-                max_length=text_max_length,
-                return_tensors=return_tensors,
+                padding=False,
+                truncation=False,
+                return_tensors=None,  # Get lists first
                 **kwargs,
             )
 
-            # Rename input_ids to char_tokens for our model
-            result["char_tokens"] = encoded["input_ids"]
-            # Store char_mask internally for attention_mask construction
-            _char_mask = encoded["attention_mask"]
+            # Add EOS token after each word (matching training dataset behavior)
+            eos_id = self.tokenizer.eos_token_id
+            for i in range(len(encoded_raw["input_ids"])):
+                # Add EOS if not already present
+                if encoded_raw["input_ids"][i][-1] != eos_id:
+                    encoded_raw["input_ids"][i].append(eos_id)
+
+            # Now apply padding and truncation
+            max_len_needed = max(len(ids) for ids in encoded_raw["input_ids"])
+            if truncation and max_len_needed > text_max_length:
+                # Truncate but preserve EOS at the end
+                for i in range(len(encoded_raw["input_ids"])):
+                    if len(encoded_raw["input_ids"][i]) > text_max_length:
+                        encoded_raw["input_ids"][i] = encoded_raw["input_ids"][i][
+                            : text_max_length - 1
+                        ] + [eos_id]
+
+            # Pad sequences
+            if padding:
+                pad_id = self.tokenizer.pad_token_id
+                for i in range(len(encoded_raw["input_ids"])):
+                    seq_len = len(encoded_raw["input_ids"][i])
+                    if seq_len < text_max_length:
+                        encoded_raw["input_ids"][i].extend([pad_id] * (text_max_length - seq_len))
+
+            # Create attention mask (1 for real tokens + EOS, 0 for padding)
+            _char_mask = []
+            for ids in encoded_raw["input_ids"]:
+                mask = [1 if token_id != self.tokenizer.pad_token_id else 0 for token_id in ids]
+                _char_mask.append(mask)
+
+            # Convert to tensors if requested
+            if return_tensors == "pt":
+                result["input_ids"] = torch.tensor(encoded_raw["input_ids"], dtype=torch.long)
+                _char_mask = torch.tensor(_char_mask, dtype=torch.long)
+            elif return_tensors == "np":
+                result["input_ids"] = np.array(encoded_raw["input_ids"], dtype=np.int64)
+                _char_mask = np.array(_char_mask, dtype=np.int64)
+            else:
+                result["input_ids"] = encoded_raw["input_ids"]
         else:
             # No text provided, create padding tokens
             if return_tensors == "pt":
@@ -164,7 +202,7 @@ class SwipeProcessor(ProcessorMixin):
                 ]
                 _char_mask = [[0] * self.max_char_len for _ in range(batch_size)]
 
-            result["char_tokens"] = char_tokens
+            result["input_ids"] = char_tokens
 
         # Create combined attention mask: [CLS] + path + [SEP] + chars
         # Sequence structure: [CLS:1] + _path_mask + [SEP:1] + _char_mask
@@ -225,3 +263,105 @@ class SwipeProcessor(ProcessorMixin):
             Decoded string
         """
         return self.tokenizer.decode(token_ids, **kwargs)
+
+    def normalize_coordinates(
+        self, data_points: list[dict], canvas_width: float = None, canvas_height: float = None
+    ) -> list[dict]:
+        """
+        Normalize swipe coordinates and timestamps.
+
+        Args:
+            data_points: List of dicts with 'x', 'y', 't' keys
+            canvas_width: Canvas width (not used - kept for compatibility)
+            canvas_height: Canvas height (not used - kept for compatibility)
+
+        Returns:
+            List of normalized coordinate dicts with x, y in [0,1] and t in [0,1]
+
+        Note:
+            For futo-org/swipe.futo.org dataset, x and y are already normalized to [0,1].
+            This function clamps them to ensure they stay in bounds and normalizes timestamps.
+        """
+        if not data_points:
+            return []
+
+        # Extract timestamps for normalization
+        timestamps = [p["t"] for p in data_points]
+        t_min = min(timestamps)
+        t_max = max(timestamps)
+        t_range = t_max - t_min if t_max > t_min else 1.0
+
+        normalized = []
+        for point in data_points:
+            # x and y are already normalized to [0,1] in the dataset
+            # But sometimes they go slightly outside bounds, so clamp them
+            x_norm = max(0.0, min(1.0, point["x"]))
+            y_norm = max(0.0, min(1.0, point["y"]))
+
+            # Normalize timestamp to [0, 1]
+            t_norm = (point["t"] - t_min) / t_range
+
+            normalized.append({"x": x_norm, "y": y_norm, "t": t_norm})
+
+        return normalized
+
+    def sample_path_points(self, data_points: list[dict], max_len: int = None) -> tuple:
+        """
+        Sample or pad path points to fixed length using linear interpolation.
+
+        Args:
+            data_points: List of coordinate dicts with 'x', 'y', 't' keys
+            max_len: Target length (defaults to self.max_path_len if not specified)
+
+        Returns:
+            Tuple of (sampled_points, mask) where:
+            - sampled_points: numpy array of shape [max_len, 3] with (x, y, t) coordinates
+            - mask: numpy array of shape [max_len] indicating valid (1) vs padding (0) points
+
+        Note:
+            - If path has fewer points than max_len, it's zero-padded
+            - If path has more points than max_len, it's downsampled using linear interpolation
+            - If path has exactly max_len points, it's returned as-is
+        """
+        if max_len is None:
+            max_len = self.max_path_len
+
+        num_points = len(data_points)
+
+        if num_points == max_len:
+            points = data_points
+            mask = [1] * max_len
+        elif num_points < max_len:
+            # Pad with zeros
+            points = data_points + [{"x": 0.0, "y": 0.0, "t": 0.0}] * (max_len - num_points)
+            mask = [1] * num_points + [0] * (max_len - num_points)
+        else:
+            # Downsample using linear interpolation
+            # Extract coordinates as arrays
+            x_coords = np.array([p["x"] for p in data_points])
+            y_coords = np.array([p["y"] for p in data_points])
+            t_coords = np.array([p["t"] for p in data_points])
+
+            # Original indices (parameter for interpolation)
+            original_indices = np.arange(num_points)
+
+            # Target indices for interpolation (evenly spaced)
+            target_indices = np.linspace(0, num_points - 1, max_len)
+
+            # Interpolate each coordinate independently
+            x_interp = np.interp(target_indices, original_indices, x_coords)
+            y_interp = np.interp(target_indices, original_indices, y_coords)
+            t_interp = np.interp(target_indices, original_indices, t_coords)
+
+            # Reconstruct points
+            points = [
+                {"x": float(x), "y": float(y), "t": float(t)}
+                for x, y, t in zip(x_interp, y_interp, t_interp, strict=True)
+            ]
+            mask = [1] * max_len
+
+        # Convert to numpy arrays
+        coords = np.array([[p["x"], p["y"], p["t"]] for p in points], dtype=np.float32)
+        mask = np.array(mask, dtype=np.int64)
+
+        return coords, mask

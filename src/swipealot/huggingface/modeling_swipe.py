@@ -1,15 +1,48 @@
 """HuggingFace-compatible model classes for SwipeTransformer."""
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import (
-    BaseModelOutput,
     BaseModelOutputWithPooling,
+    ModelOutput,
     SequenceClassifierOutput,
 )
 
 from .configuration_swipe import SwipeCrossEncoderConfig, SwipeTransformerConfig
+
+
+@dataclass
+class SwipeTransformerOutput(ModelOutput):
+    """
+    Output type for SwipeTransformerModel.
+
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (character prediction).
+        char_logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, vocab_size)`):
+            Prediction scores of the character prediction head.
+        path_logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, 3)`, *optional*):
+            Prediction scores of the path prediction head (if enabled).
+        length_logits (`torch.FloatTensor` of shape `(batch_size, max_length+1)`, *optional*):
+            Prediction scores of the length prediction head (if enabled).
+        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the last layer of the model.
+        pooler_output (`torch.FloatTensor` of shape `(batch_size, hidden_size)`):
+            SEP token embeddings for similarity/embedding tasks.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+    """
+
+    loss: torch.FloatTensor | None = None
+    char_logits: torch.FloatTensor = None
+    path_logits: torch.FloatTensor | None = None
+    length_logits: torch.FloatTensor | None = None
+    last_hidden_state: torch.FloatTensor = None
+    pooler_output: torch.FloatTensor | None = None
+    hidden_states: tuple[torch.FloatTensor] | None = None
 
 
 class SwipeTransformerPreTrainedModel(PreTrainedModel):
@@ -54,7 +87,7 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
 
         # Import existing components
         from ..models.embeddings import MixedEmbedding
-        from ..models.heads import CharacterPredictionHead, PathPredictionHead
+        from ..models.heads import CharacterPredictionHead, LengthPredictionHead, PathPredictionHead
 
         # Embeddings
         self.embeddings = MixedEmbedding(
@@ -92,13 +125,20 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
         else:
             self.path_head = None
 
+        # Length prediction head (predicts word length from path)
+        # Max length is max_char_len (including EOS)
+        self.length_head = LengthPredictionHead(
+            d_model=config.d_model,
+            max_length=config.max_char_len,
+        )
+
         # Initialize weights
         self.post_init()
 
     def forward(
         self,
         path_coords: torch.Tensor,
-        char_tokens: torch.Tensor,
+        input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         return_dict: bool | None = None,
@@ -109,14 +149,21 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
 
         Args:
             path_coords (torch.Tensor): Path coordinates [batch, path_len, 3]
-            char_tokens (torch.Tensor): Character tokens [batch, char_len]
+            input_ids (torch.Tensor): Character token IDs [batch, char_len]
             attention_mask (torch.Tensor, optional): Attention mask [batch, seq_len]
             labels (torch.Tensor, optional): Labels for loss calculation [batch, char_len]
             return_dict (bool, optional): Whether to return ModelOutput object
             output_hidden_states (bool, optional): Whether to output hidden states
 
         Returns:
-            BaseModelOutput or tuple: Model outputs
+            SwipeTransformerOutput or tuple: Model outputs with:
+                - loss: Optional loss value
+                - char_logits: Character prediction logits [batch, seq_len, vocab_size]
+                - path_logits: Path prediction logits [batch, seq_len, 3] (if predict_path=True)
+                - length_logits: Length prediction logits [batch, max_length]
+                - last_hidden_state: Hidden states [batch, seq_len, d_model]
+                - pooler_output: SEP token embeddings [batch, d_model] for similarity/embedding tasks
+                - hidden_states: Tuple of hidden states (if output_hidden_states=True)
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -132,7 +179,7 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
         )
 
         # Get embeddings
-        embeddings = self.embeddings(path_coords, char_tokens, cls_token, sep_token)
+        embeddings = self.embeddings(path_coords, input_ids, cls_token, sep_token)
 
         # Prepare attention mask for encoder
         if attention_mask is not None:
@@ -153,26 +200,40 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
         if self.path_head is not None:
             path_logits = self.path_head(hidden_states)
 
+        # Length prediction from CLS token
+        cls_hidden = hidden_states[:, 0, :]  # [batch, d_model] - CLS at position 0
+        length_logits = self.length_head(cls_hidden)  # [batch, max_length]
+
+        # Extract SEP token embedding for pooler output (embeddings/similarity tasks)
+        # SEP is at position 1 + path_len
+        path_len = path_coords.shape[1]
+        sep_position = 1 + path_len
+        pooler_output = hidden_states[:, sep_position, :]  # [batch, d_model]
+
         # Compute loss if labels provided
         loss = None
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)
             # Extract character positions from hidden states
             # Sequence is: [CLS] + path + [SEP] + chars
-            path_len = path_coords.shape[1]
             char_start = 1 + path_len + 1  # After [CLS], path, and [SEP]
             char_hidden = hidden_states[:, char_start : char_start + labels.shape[1], :]
             char_pred = self.char_head(char_hidden)
             loss = loss_fct(char_pred.reshape(-1, self.config.vocab_size), labels.reshape(-1))
 
         if not return_dict:
-            output = (hidden_states, char_logits)
+            output = (hidden_states, char_logits, length_logits, pooler_output)
             if path_logits is not None:
                 output = output + (path_logits,)
             return ((loss,) + output) if loss is not None else output
 
-        return BaseModelOutput(
+        return SwipeTransformerOutput(
+            loss=loss,
+            char_logits=char_logits,
+            path_logits=path_logits,
+            length_logits=length_logits,
             last_hidden_state=hidden_states,
+            pooler_output=pooler_output,
             hidden_states=(hidden_states,) if output_hidden_states else None,
         )
 
@@ -237,7 +298,7 @@ class SwipeCrossEncoderForSequenceClassification(SwipeTransformerPreTrainedModel
     def forward(
         self,
         path_coords: torch.Tensor,
-        char_tokens: torch.Tensor,
+        input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         return_dict: bool | None = None,
@@ -247,7 +308,7 @@ class SwipeCrossEncoderForSequenceClassification(SwipeTransformerPreTrainedModel
 
         Args:
             path_coords (torch.Tensor): Path coordinates [batch, path_len, 3]
-            char_tokens (torch.Tensor): Character tokens [batch, char_len]
+            input_ids (torch.Tensor): Character token IDs [batch, char_len]
             attention_mask (torch.Tensor, optional): Attention mask [batch, seq_len]
             labels (torch.Tensor, optional): Labels for loss calculation [batch, num_labels]
             return_dict (bool, optional): Whether to return ModelOutput object
@@ -269,7 +330,7 @@ class SwipeCrossEncoderForSequenceClassification(SwipeTransformerPreTrainedModel
         )
 
         # Get embeddings
-        embeddings = self.embeddings(path_coords, char_tokens, cls_token, sep_token)
+        embeddings = self.embeddings(path_coords, input_ids, cls_token, sep_token)
 
         # Prepare attention mask
         if attention_mask is not None:
@@ -323,6 +384,11 @@ class SwipeModel(SwipeTransformerPreTrainedModel):
     """
     Base Swipe model for extracting embeddings.
 
+    .. deprecated::
+        This class is deprecated. Use SwipeTransformerModel instead, which now
+        includes pooler_output for embeddings alongside prediction heads.
+        SwipeTransformerModel provides both predictions AND embeddings in a single model.
+
     This model returns the SEP token embedding, which can be used for:
     - Vector databases
     - Semantic search
@@ -330,7 +396,7 @@ class SwipeModel(SwipeTransformerPreTrainedModel):
 
     The SEP token embedding represents the joint encoding of the path and text.
 
-    Usage:
+    Usage (Deprecated - use SwipeTransformerModel instead):
         ```python
         from transformers import AutoModel
 
@@ -340,7 +406,7 @@ class SwipeModel(SwipeTransformerPreTrainedModel):
         )
 
         # Get embeddings
-        outputs = model(path_coords=paths, char_tokens=tokens)
+        outputs = model(path_coords=paths, input_ids=tokens)
         embeddings = outputs.pooler_output  # SEP token embeddings
         ```
 
@@ -386,7 +452,7 @@ class SwipeModel(SwipeTransformerPreTrainedModel):
     def forward(
         self,
         path_coords: torch.Tensor,
-        char_tokens: torch.Tensor,
+        input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         return_dict: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -396,7 +462,7 @@ class SwipeModel(SwipeTransformerPreTrainedModel):
 
         Args:
             path_coords (torch.Tensor): Path coordinates [batch, path_len, 3]
-            char_tokens (torch.Tensor): Character tokens [batch, char_len]
+            input_ids (torch.Tensor): Character token IDs [batch, char_len]
             attention_mask (torch.Tensor, optional): Attention mask [batch, seq_len]
             return_dict (bool, optional): Whether to return ModelOutput object
             output_hidden_states (bool, optional): Whether to output all hidden states
@@ -421,7 +487,7 @@ class SwipeModel(SwipeTransformerPreTrainedModel):
         )
 
         # Get embeddings
-        embeddings = self.embeddings(path_coords, char_tokens, cls_token, sep_token)
+        embeddings = self.embeddings(path_coords, input_ids, cls_token, sep_token)
 
         # Prepare attention mask
         if attention_mask is not None:
