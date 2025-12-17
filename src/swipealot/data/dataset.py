@@ -5,7 +5,6 @@ Preprocessing utilities live in `swipealot.data.preprocessing`.
 
 from typing import Any
 
-import numpy as np
 import torch
 from datasets import load_dataset
 from torch.utils.data import Dataset
@@ -31,6 +30,7 @@ class SwipeDataset(Dataset):
         tokenizer: CharacterTokenizer | None = None,
         dataset_name: str = "futo-org/swipe.futo.org",
         max_samples: int | None = None,
+        path_resample_mode: str = "time",
     ):
         """
         Initialize swipe dataset.
@@ -45,6 +45,7 @@ class SwipeDataset(Dataset):
         """
         self.max_path_len = max_path_len
         self.max_word_len = max_word_len
+        self.path_resample_mode = path_resample_mode
 
         # Load dataset
         print(f"Loading dataset: {dataset_name}, split: {split}")
@@ -69,9 +70,11 @@ class SwipeDataset(Dataset):
         # Normalize and compute motion features (x, y, dx, dy, ds, log_dt)
         processed_points = normalize_and_compute_features(data_points)
 
-        # Spatially uniform resampling to fixed length with 6D features
+        # Resampling to fixed length with 6D features
         path_features, path_mask = sample_path_points_with_features(
-            processed_points, self.max_path_len
+            processed_points,
+            self.max_path_len,
+            resample_mode=self.path_resample_mode,
         )
 
         # Process word

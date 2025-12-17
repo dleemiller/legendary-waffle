@@ -15,6 +15,7 @@ class SwipeLoss(nn.Module):
         char_weight: float = 1.0,
         path_weight: float = 0.1,
         length_weight: float = 0.0,
+        path_loss_dims: list[int] | None = None,
         focal_gamma: float = 0.0,
         char_class_weights: torch.Tensor | None = None,
         contrastive_weight: float = 0.0,
@@ -33,6 +34,7 @@ class SwipeLoss(nn.Module):
         self.char_weight = char_weight
         self.path_weight = path_weight
         self.length_weight = length_weight
+        self.path_loss_dims = path_loss_dims[:] if path_loss_dims is not None else None
         self.focal_gamma = focal_gamma
         self.contrastive_weight = contrastive_weight
         self.contrastive_temperature = contrastive_temperature
@@ -191,6 +193,19 @@ class SwipeLoss(nn.Module):
                 path_start = 1  # Skip [CLS]
                 path_end = 1 + path_len
                 path_pred_subset = path_pred[:, path_start:path_end, :]
+
+            # Optionally compute path loss on a subset of feature dims (e.g. x/y only).
+            if self.path_loss_dims is not None:
+                dims = [int(d) for d in self.path_loss_dims]
+                if len(dims) == 0:
+                    raise ValueError("path_loss_dims must be non-empty when provided")
+                max_dim = int(path_labels.shape[-1])
+                if any(d < 0 or d >= max_dim for d in dims):
+                    raise ValueError(
+                        f"path_loss_dims {dims} out of range for path_input_dim={max_dim}"
+                    )
+                path_pred_subset = path_pred_subset[..., dims]
+                path_labels = path_labels[..., dims]
 
             # Compute MSE only on masked positions
             path_loss = self.path_loss_fn(path_pred_subset, path_labels)  # [batch, path_len, D]

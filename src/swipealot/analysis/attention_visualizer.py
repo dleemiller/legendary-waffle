@@ -1,19 +1,66 @@
-"""Visualization functions for attention analysis.
+"""Visualization helpers for swipe attention analysis.
 
-This module provides 3D visualizations showing how the model's attention
-focuses on different regions of the swipe path when predicting each character.
+The primary entry points are:
+- `create_layer_comparison_grid`
+- `create_summary_visualization`
+- `create_layer_pooled_visualization`
+- `create_single_layer_timeline_plot`
+- `create_attention_timeline_plot`
 """
 
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-import torch
 from matplotlib import cm
 from matplotlib.colors import Normalize
 
 # Set seaborn style for better aesthetics
 sns.set_context("notebook", font_scale=1.0)
 sns.set_style("whitegrid")
+
+
+def _filter_path_points(
+    path_coords: np.ndarray, path_mask: np.ndarray | None
+) -> tuple[np.ndarray, np.ndarray]:
+    if path_mask is None:
+        return path_coords, np.arange(len(path_coords))
+    valid_indices = np.where(path_mask == 1)[0]
+    return path_coords[valid_indices], valid_indices
+
+
+def _infer_time_axis(path_coords: np.ndarray) -> tuple[np.ndarray, str]:
+    """Infer a sensible x-axis for timeline plots.
+
+    Supported path formats:
+    - [n, 3]: (x, y, t) where t may be unix time or relative time.
+    - [n, 6]: (x, y, dx, dy, ds, log1p(dt)) => time is cumulative expm1(log1p(dt)).
+    - [n, 2] or other: fall back to path position index.
+    """
+    if path_coords.ndim != 2:
+        raise ValueError(f"path_coords must be 2D, got shape {path_coords.shape}")
+
+    n_points, d = path_coords.shape
+    if n_points == 0:
+        return np.array([]), "Time"
+
+    # Engineered features: (x, y, dx, dy, ds, log1p(dt))
+    if d >= 6:
+        log1dt = path_coords[:, 5]
+        dt = np.expm1(log1dt)
+        dt = np.clip(dt, 0.0, None)
+        times = np.cumsum(dt)
+        return times, "Time (cumulative dt)"
+
+    # Raw (x, y, t)
+    if d >= 3:
+        t = path_coords[:, 2]
+        # If it looks like unix time, convert to relative seconds
+        if np.nanmedian(t) > 1e8:
+            t0 = t[0]
+            return t - t0, "Time (relative)"
+        return t, "Time"
+
+    return np.arange(n_points), "Path position"
 
 
 def plot_attention_heatmap_on_path(
@@ -31,7 +78,7 @@ def plot_attention_heatmap_on_path(
 
     Args:
         ax: Matplotlib 3D axes to plot on
-        path_coords: Path coordinates [n_path_points, 3] (x, y, t)
+        path_coords: Path coordinates [n_path_points, *] (supports raw [n,3] or engineered [n,6])
         attention: Attention weights [n_chars, n_path_points]
         char_idx: Index of character to visualize (0 to n_chars-1)
         word: The target word
@@ -40,20 +87,14 @@ def plot_attention_heatmap_on_path(
         global_vmin: Global minimum for color normalization (optional)
         global_vmax: Global maximum for color normalization (optional)
     """
-    # Filter to only valid path points if mask is provided
-    if path_mask is not None:
-        valid_indices = np.where(path_mask == 1)[0]
-        path_coords = path_coords[valid_indices]
-        # Also filter attention to match
-        char_attention_full = attention[char_idx, :]
-        char_attention = char_attention_full[valid_indices]
-    else:
-        char_attention = attention[char_idx, :]
+    path_coords_filtered, valid_indices = _filter_path_points(path_coords, path_mask)
+    char_attention_full = attention[char_idx, :]
+    char_attention = char_attention_full[valid_indices]
 
-    # Extract x, y, t coordinates
-    xs = path_coords[:, 0]
-    ys = path_coords[:, 1]
-    ts = path_coords[:, 2]
+    # Extract x, y coordinates and infer time axis
+    xs = path_coords_filtered[:, 0]
+    ys = path_coords_filtered[:, 1]
+    ts, time_label = _infer_time_axis(path_coords_filtered)
 
     # Use global normalization if provided, otherwise normalize per-plot
     if global_vmin is not None and global_vmax is not None:
@@ -132,7 +173,7 @@ def plot_attention_heatmap_on_path(
     # 3D axis labels
     ax.set_xlabel("X", fontsize=9, labelpad=10)
     ax.set_ylabel("Y", fontsize=9, labelpad=10)
-    ax.set_zlabel("Time", fontsize=9, labelpad=10)
+    ax.set_zlabel(time_label, fontsize=9, labelpad=10)
 
     # Set axis limits
     ax.set_xlim(0, 1)
@@ -151,18 +192,6 @@ def plot_attention_heatmap_on_path(
     cbar.set_label("Attention", rotation=270, labelpad=15, fontsize=9)
     cbar.ax.tick_params(labelsize=8)
 
-    # # Add attention statistics as text
-    # stats_text = f"Max: {char_attention.max():.3f}\nMean: {char_attention.mean():.3f}"
-    # ax.text2D(
-    #     0.02,
-    #     0.98,
-    #     stats_text,
-    #     transform=ax.transAxes,
-    #     fontsize=7,
-    #     verticalalignment="top",
-    #     bbox=dict(boxstyle="round", facecolor="white", alpha=0.7),
-    # )
-
 
 def create_layer_comparison_grid(
     layer_attentions: dict[int, np.ndarray],
@@ -179,7 +208,7 @@ def create_layer_comparison_grid(
 
     Args:
         layer_attentions: Dict mapping layer_idx -> attention [n_chars, n_path_points]
-        path_coords: Path coordinates [n_path_points, 3]
+        path_coords: Path coordinates [n_path_points, *]
         word: Target word
         char_indices: Which characters to visualize (default: first 5 or all if word is short)
         figsize: Figure size (default: auto-calculated)
@@ -249,170 +278,6 @@ def create_layer_comparison_grid(
     return fig
 
 
-def plot_attention_profile_1d(
-    ax: plt.Axes,
-    attention: np.ndarray,
-    char_idx: int,
-    word: str,
-    layer_name: str = "",
-):
-    """Plot 1D attention profile showing attention vs path position.
-
-    Args:
-        ax: Matplotlib axes
-        attention: Attention weights [n_chars, n_path_points]
-        char_idx: Character index
-        word: Target word
-        layer_name: Optional layer name
-    """
-    char_attention = attention[char_idx, :]  # [n_path_points]
-    path_positions = np.arange(len(char_attention))
-
-    # Plot attention profile
-    ax.plot(path_positions, char_attention, "b-", linewidth=2, label="Attention")
-    ax.fill_between(path_positions, char_attention, alpha=0.3)
-
-    # Mark maximum attention position
-    max_pos = np.argmax(char_attention)
-    max_val = char_attention[max_pos]
-    ax.scatter([max_pos], [max_val], c="red", s=100, zorder=10, label="Max")
-
-    # Character label
-    if char_idx < len(word):
-        char = word[char_idx]
-        char_label = f"'{char}'"
-    else:
-        char_label = f"pos {char_idx}"
-
-    # Title and labels
-    title = f"Char {char_idx}: {char_label}"
-    if layer_name:
-        title = f"{layer_name} - {title}"
-    ax.set_title(title, fontsize=10, fontweight="bold")
-    ax.set_xlabel("Path Position", fontsize=8)
-    ax.set_ylabel("Attention Weight", fontsize=8)
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=7)
-
-    # Statistics
-    stats_text = f"Max: {max_val:.4f}\nMean: {char_attention.mean():.4f}\nPos: {max_pos}"
-    ax.text(
-        0.98,
-        0.98,
-        stats_text,
-        transform=ax.transAxes,
-        fontsize=7,
-        verticalalignment="top",
-        horizontalalignment="right",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.7),
-    )
-
-
-def plot_head_contribution_heatmap(
-    ax: plt.Axes,
-    attention_weights: torch.Tensor,
-    word: str,
-    layer_idx: int,
-):
-    """Visualize which heads contribute most for each character (using max pooling).
-
-    Creates a heatmap: rows = characters, columns = heads, values = max attention from that head.
-
-    Args:
-        ax: Matplotlib axes
-        attention_weights: Full attention tensor [batch, n_heads, seq_len, seq_len]
-        word: Target word
-        layer_idx: Layer index for title
-    """
-    # Extract char→path attention for all heads: [batch, n_heads, n_chars, n_path]
-    char_to_path = attention_weights[:, :, 130:178, 1:129]
-
-    # For each character and head, get max attention to any path position
-    # [batch, n_heads, n_chars]
-    max_attn_per_head = char_to_path.max(dim=-1)[0]
-
-    # Remove batch dimension (assuming batch=1)
-    max_attn_per_head = max_attn_per_head[0]  # [n_heads, n_chars]
-
-    # Transpose to [n_chars, n_heads] for plotting
-    heatmap_data = max_attn_per_head.T.cpu().numpy()
-
-    # Only show characters in word
-    word_len = len(word)
-    heatmap_data = heatmap_data[:word_len, :]
-
-    # Create heatmap
-    im = ax.imshow(heatmap_data, aspect="auto", cmap="hot", interpolation="nearest")
-
-    # Labels
-    ax.set_xlabel("Attention Head", fontsize=10)
-    ax.set_ylabel("Character Position", fontsize=10)
-    ax.set_title(f"Layer {layer_idx}: Head Contributions", fontsize=11, fontweight="bold")
-
-    # Set ticks
-    ax.set_xticks(range(12))
-    ax.set_xticklabels(range(12), fontsize=8)
-    ax.set_yticks(range(word_len))
-    ax.set_yticklabels([f"{i}: '{word[i]}'" for i in range(word_len)], fontsize=8)
-
-    # Colorbar
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label("Max Attention", rotation=270, labelpad=15, fontsize=9)
-    cbar.ax.tick_params(labelsize=8)
-
-    # Grid
-    ax.set_xticks(np.arange(12) - 0.5, minor=True)
-    ax.set_yticks(np.arange(word_len) - 0.5, minor=True)
-    ax.grid(which="minor", color="white", linestyle="-", linewidth=0.5)
-
-
-def plot_attention_evolution(
-    ax: plt.Axes,
-    layer_attentions: dict[int, np.ndarray],
-    char_idx: int,
-    word: str,
-):
-    """Show how attention for a single character evolves across layers.
-
-    Args:
-        ax: Matplotlib axes
-        layer_attentions: Dict mapping layer_idx -> attention [n_chars, n_path_points]
-        char_idx: Character index to visualize
-        word: Target word
-    """
-    layer_ids = sorted(layer_attentions.keys())
-    path_positions = np.arange(layer_attentions[layer_ids[0]].shape[1])
-
-    # Plot line for each layer
-    for layer_idx in layer_ids:
-        attention = layer_attentions[layer_idx]
-        char_attention = attention[char_idx, :]
-        ax.plot(
-            path_positions,
-            char_attention,
-            linewidth=2,
-            label=f"Layer {layer_idx}",
-            alpha=0.7,
-        )
-
-    # Character label
-    if char_idx < len(word):
-        char = word[char_idx]
-        char_label = f"'{char}'"
-    else:
-        char_label = f"pos {char_idx}"
-
-    ax.set_title(
-        f"Attention Evolution - Char {char_idx}: {char_label}",
-        fontsize=11,
-        fontweight="bold",
-    )
-    ax.set_xlabel("Path Position", fontsize=9)
-    ax.set_ylabel("Attention Weight", fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
-
-
 def create_summary_visualization(
     layer_attentions: dict[int, np.ndarray],
     path_coords: np.ndarray,
@@ -420,23 +285,7 @@ def create_summary_visualization(
     save_path: str | None = None,
     path_mask: np.ndarray | None = None,
 ) -> plt.Figure:
-    """Create comprehensive summary visualization combining multiple views.
-
-    Layout:
-    - Top: Layer comparison grid (first 3 chars)
-    - Bottom left: Attention evolution for first char
-    - Bottom right: 1D profiles for each layer
-
-    Args:
-        layer_attentions: Dict mapping layer_idx -> attention
-        path_coords: Path coordinates
-        word: Target word
-        save_path: Optional save path
-        path_mask: Optional mask indicating valid path points (1=valid, 0=padding)
-
-    Returns:
-        Matplotlib figure
-    """
+    """Create a compact summary figure (3 layers × 3 characters)."""
     fig = plt.figure(figsize=(18, 12))
 
     # Create grid
@@ -525,7 +374,7 @@ def create_layer_pooled_visualization(
 
     Args:
         layer_attentions: Dict mapping layer_idx -> attention [n_chars, n_path_points]
-        path_coords: Path coordinates [n_path_points, 3]
+        path_coords: Path coordinates [n_path_points, *]
         word: Target word
         pooling_method: How layers were pooled ("max", "mean", or "sum")
         save_path: Optional save path
@@ -618,7 +467,7 @@ def create_single_layer_timeline_plot(
     Args:
         layer_attention: Attention for single layer [n_chars, n_path_points]
         layer_idx: Index of the layer
-        path_coords: Path coordinates [n_path_points, 3] (x, y, t)
+        path_coords: Path coordinates [n_path_points, *] (supports raw [n,3] or engineered [n,6])
         word: Target word
         save_path: Optional save path
         path_mask: Optional mask indicating valid path points
@@ -626,18 +475,10 @@ def create_single_layer_timeline_plot(
     Returns:
         Matplotlib figure
     """
-    # Filter path coords if mask provided
-    if path_mask is not None:
-        valid_indices = np.where(path_mask == 1)[0]
-        path_coords_filtered = path_coords[valid_indices]
-        layer_attention_filtered = layer_attention[:, valid_indices]
-    else:
-        path_coords_filtered = path_coords
-        layer_attention_filtered = layer_attention
-        valid_indices = np.arange(len(path_coords))
+    path_coords_filtered, valid_indices = _filter_path_points(path_coords, path_mask)
+    layer_attention_filtered = layer_attention[:, valid_indices]
 
-    # Extract time values
-    times = path_coords_filtered[:, 2]
+    times, time_label = _infer_time_axis(path_coords_filtered)
 
     # Create figure
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -692,7 +533,7 @@ def create_single_layer_timeline_plot(
     )
 
     # Formatting
-    ax.set_xlabel("Time", fontsize=12, fontweight="bold")
+    ax.set_xlabel(time_label, fontsize=12, fontweight="bold")
     ax.set_ylabel("Attention Score", fontsize=12, fontweight="bold")
     ax.set_title(
         f'Attention Timeline: "{word}" (Layer {layer_idx})', fontsize=14, fontweight="bold", pad=20
@@ -716,33 +557,22 @@ def create_attention_timeline_plot(
     pooling_method: str = "max",
     save_path: str | None = None,
     path_mask: np.ndarray | None = None,
-    special_token_attentions: dict[str, dict[int, np.ndarray]] | None = None,
 ) -> plt.Figure:
     """Create 2D line plot showing attention vs time for each character.
 
     Args:
         layer_attentions: Dict mapping layer_idx -> attention [n_chars, n_path_points]
-        path_coords: Path coordinates [n_path_points, 3] (x, y, t)
+        path_coords: Path coordinates [n_path_points, *] (supports raw [n,3] or engineered [n,6])
         word: Target word
         pooling_method: How layers were pooled ("max", "mean", or "sum")
         save_path: Optional save path
         path_mask: Optional mask indicating valid path points
-        special_token_attentions: Optional dict with 'cls', 'sep', 'eos' keys,
-                                  each mapping layer_idx -> attention [n_path_points]
-
     Returns:
         Matplotlib figure
     """
-    # Filter path coords if mask provided
-    if path_mask is not None:
-        valid_indices = np.where(path_mask == 1)[0]
-        path_coords_filtered = path_coords[valid_indices]
-    else:
-        path_coords_filtered = path_coords
-        valid_indices = np.arange(len(path_coords))
+    path_coords_filtered, valid_indices = _filter_path_points(path_coords, path_mask)
 
-    # Extract time values
-    times = path_coords_filtered[:, 2]
+    times, time_label = _infer_time_axis(path_coords_filtered)
 
     # Pool attention across all layers
     attention_stack = np.stack([attn for attn in layer_attentions.values()], axis=0)
@@ -788,84 +618,8 @@ def create_attention_timeline_plot(
             markeredgecolor="white",
         )
 
-    # Plot special tokens if provided and collect them for aggregate stats
-    pooled_special_tokens = {}
-    if False and special_token_attentions is not None:
-        # Pool special token attentions across layers
-        for token_name, token_layers in special_token_attentions.items():
-            # Stack and pool across layers
-            token_stack = np.stack([attn for attn in token_layers.values()], axis=0)
-
-            if pooling_method == "max":
-                pooled_token = token_stack.max(axis=0)
-            elif pooling_method == "mean":
-                pooled_token = token_stack.mean(axis=0)
-            elif pooling_method == "sum":
-                pooled_token = token_stack.sum(axis=0)
-            elif pooling_method == "logsumexp":
-                from scipy.special import logsumexp
-
-                pooled_token = logsumexp(token_stack, axis=0)
-
-            # Filter to valid indices
-            if path_mask is not None:
-                pooled_token = pooled_token[valid_indices]
-
-            # Store for aggregate calculations
-            pooled_special_tokens[token_name] = pooled_token
-
-            # Plot with distinct styling
-            if token_name == "cls":
-                ax.plot(
-                    times,
-                    pooled_token,
-                    linewidth=2,
-                    label="[CLS]",
-                    color="purple",
-                    alpha=0.7,
-                    linestyle=":",
-                    marker="^",
-                    markersize=3,
-                    markeredgewidth=0.5,
-                    markeredgecolor="white",
-                )
-            elif token_name == "sep":
-                ax.plot(
-                    times,
-                    pooled_token,
-                    linewidth=2,
-                    label="[SEP]",
-                    color="orange",
-                    alpha=0.7,
-                    linestyle=":",
-                    marker="v",
-                    markersize=3,
-                    markeredgewidth=0.5,
-                    markeredgecolor="white",
-                )
-            elif token_name == "eos":
-                ax.plot(
-                    times,
-                    pooled_token,
-                    linewidth=2,
-                    label="[EOS]",
-                    color="brown",
-                    alpha=0.7,
-                    linestyle=":",
-                    marker="d",
-                    markersize=3,
-                    markeredgewidth=0.5,
-                    markeredgecolor="white",
-                )
-
-    # Compute max and mean across ALL tokens (characters + special tokens)
-    # Collect all attention arrays
-    all_attentions = [pooled_attention[i, :] for i in range(len(word))]
-    if pooled_special_tokens:
-        all_attentions.extend(pooled_special_tokens.values())
-
-    # Stack and compute aggregates
-    all_attention_stack = np.stack(all_attentions, axis=0)
+    # Compute max and mean across characters
+    all_attention_stack = np.stack([pooled_attention[i, :] for i in range(len(word))], axis=0)
     max_attention_all = all_attention_stack.max(axis=0)
     mean_attention_all = all_attention_stack.mean(axis=0)
 
@@ -902,7 +656,7 @@ def create_attention_timeline_plot(
     )
 
     # Formatting
-    ax.set_xlabel("Time", fontsize=12, fontweight="bold")
+    ax.set_xlabel(time_label, fontsize=12, fontweight="bold")
     ax.set_ylabel("Attention Score", fontsize=12, fontweight="bold")
     ax.set_title(
         f'Attention Timeline: "{word}" ({pooling_method.capitalize()} across {len(layer_attentions)} layers)',

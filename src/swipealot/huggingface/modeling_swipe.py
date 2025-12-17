@@ -42,6 +42,7 @@ class SwipeTransformerOutput(ModelOutput):
     last_hidden_state: torch.FloatTensor = None
     pooler_output: torch.FloatTensor | None = None
     hidden_states: tuple[torch.FloatTensor] | None = None
+    attentions: tuple[torch.FloatTensor] | None = None
 
 
 class SwipeTransformerPreTrainedModel(PreTrainedModel):
@@ -148,6 +149,7 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
         labels: torch.Tensor | dict | None = None,
         return_dict: bool | None = None,
         output_hidden_states: bool | None = None,
+        output_attentions: bool | None = None,
         **kwargs,
     ):
         """
@@ -186,6 +188,9 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
             char_labels = labels
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_attentions = (
+            output_attentions if output_attentions is not None else self.config.output_attentions
+        )
 
         batch_size = path_coords.shape[0]
         device = path_coords.device
@@ -210,7 +215,64 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
             src_key_padding_mask = None
 
         # Encode (batch_first=True is set in TransformerEncoderLayer)
-        hidden_states = self.encoder(embeddings, src_key_padding_mask=src_key_padding_mask)
+        attentions = None
+        if output_attentions:
+            attentions_buffer: list[torch.Tensor | None] = [None] * len(self.encoder.layers)
+            hooks = []
+            original_forwards: dict[int, callable] = {}
+
+            def make_hook(layer_idx: int):
+                def hook(module: nn.Module, _input: tuple, output: tuple):
+                    if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
+                        attentions_buffer[layer_idx] = output[1]
+
+                return hook
+
+            def make_patched_forward(original_forward):
+                def patched_forward(
+                    query,
+                    key,
+                    value,
+                    key_padding_mask=None,
+                    need_weights=True,
+                    attn_mask=None,
+                    average_attn_weights=False,
+                    is_causal=False,
+                ):
+                    return original_forward(
+                        query,
+                        key,
+                        value,
+                        key_padding_mask=key_padding_mask,
+                        need_weights=True,
+                        attn_mask=attn_mask,
+                        average_attn_weights=False,
+                        is_causal=is_causal,
+                    )
+
+                return patched_forward
+
+            for idx, layer in enumerate(self.encoder.layers):
+                attn_module = layer.self_attn
+                original_forwards[idx] = attn_module.forward
+                attn_module.forward = make_patched_forward(original_forwards[idx])
+                hooks.append(attn_module.register_forward_hook(make_hook(idx)))
+
+            try:
+                hidden_states = self.encoder(embeddings, src_key_padding_mask=src_key_padding_mask)
+                if any(a is None for a in attentions_buffer):
+                    missing = [i for i, a in enumerate(attentions_buffer) if a is None]
+                    raise RuntimeError(
+                        f"Failed to capture attention weights for layers: {missing}."
+                    )
+                attentions = tuple(attentions_buffer)  # type: ignore[assignment]
+            finally:
+                for hook in hooks:
+                    hook.remove()
+                for idx, layer in enumerate(self.encoder.layers):
+                    layer.self_attn.forward = original_forwards[idx]
+        else:
+            hidden_states = self.encoder(embeddings, src_key_padding_mask=src_key_padding_mask)
 
         path_len = path_coords.shape[1]
         char_len = input_ids.shape[1]
@@ -256,6 +318,8 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
             output = (hidden_states, char_logits, length_logits, pooler_output)
             if path_logits is not None:
                 output = output + (path_logits,)
+            if attentions is not None:
+                output = output + (attentions,)
             return ((loss,) + output) if loss is not None else output
 
         return SwipeTransformerOutput(
@@ -266,6 +330,7 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
             last_hidden_state=hidden_states,
             pooler_output=pooler_output,
             hidden_states=(hidden_states,) if output_hidden_states else None,
+            attentions=attentions,
         )
 
 

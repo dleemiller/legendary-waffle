@@ -238,7 +238,7 @@ def test_spatial_resampling_is_approximately_uniform_in_distance():
         {"x": 0.9, "y": 0.0, "dx": 0.8, "dy": 0.0, "ds": 0.8, "dt": 10.0, "log_dt": np.log1p(10.0)},
         {"x": 1.0, "y": 0.0, "dx": 0.1, "dy": 0.0, "ds": 0.1, "dt": 10.0, "log_dt": np.log1p(10.0)},
     ]
-    features, _ = sample_path_points_with_features(points, max_len=5)
+    features, _ = sample_path_points_with_features(points, max_len=5, resample_mode="spatial")
 
     dx = features[:, 2]
     dy = features[:, 3]
@@ -249,3 +249,32 @@ def test_spatial_resampling_is_approximately_uniform_in_distance():
     # For a straight line, distances should be ~uniform except the first step (0)
     steps = ds[1:]
     assert np.max(steps) - np.min(steps) < 1e-2
+
+
+def test_time_resampling_is_approximately_uniform_in_time():
+    # Path that moves quickly then dwells for a long time.
+    # Under time-uniform resampling we should get near-constant dt across resampled points.
+    points = [
+        {"x": 0.0, "y": 0.0, "t": 0.0},
+        {"x": 1.0, "y": 0.0, "t": 5.0},  # fast move
+        {"x": 1.0, "y": 0.0, "t": 205.0},  # dwell
+        {"x": 1.0, "y": 0.0, "t": 405.0},  # dwell
+    ]
+    processed = normalize_and_compute_features(points, dt_clamp_min_ms=1.0, dt_clamp_max_ms=200.0)
+    features, mask = sample_path_points_with_features(
+        processed,
+        max_len=9,
+        resample_mode="time",
+        dt_clamp_min_ms=1.0,
+        dt_clamp_max_ms=200.0,
+    )
+
+    assert features.shape == (9, 6)
+    assert np.all(mask == 1)
+
+    # log_dt is log1p(dt) for resampled dt, with dt clamped to [1,200] except first=0.
+    dt = np.expm1(features[:, 5])
+    assert dt[0] == pytest.approx(0.0)
+    # For time-uniform resampling, dt should be approximately constant for i>0.
+    steps = dt[1:]
+    assert np.max(steps) - np.min(steps) < 1e-3

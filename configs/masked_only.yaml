@@ -18,6 +18,8 @@ data:
   test_split: "test"
   max_path_len: 128
   max_char_len: 48
+  path_resample_mode: "time"
+  path_mask_block_max_len: 32
   char_mask_prob: 1.0     # Random masking probability between 50% and 100%
   path_mask_prob: 0.0            # Disable path masking
   mask_path: false               # Disable path masking
@@ -29,6 +31,7 @@ training:
   char_loss_weight: 1.0
   path_loss_weight: 0.0
   length_loss_weight: 0.0
+  path_loss_dims: [0, 1]
   use_focal_loss: true
   focal_gamma: 2.0
   use_char_freq_weights: true

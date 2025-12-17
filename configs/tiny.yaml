@@ -16,6 +16,8 @@ data:
   test_split: "test"
   max_path_len: 128  # Linear interpolation for paths >128 points (18% of data)
   max_char_len: 48
+  path_resample_mode: "time"
+  path_mask_block_max_len: 32
   char_mask_prob: 0.50
   path_mask_prob: 0.50
   mask_path: true
@@ -26,6 +28,7 @@ training:
   char_loss_weight: 1.0
   path_loss_weight: 0.5
   length_loss_weight: 0.1
+  path_loss_dims: [0, 1]
   use_focal_loss: true
   focal_gamma: 2.0
   use_char_freq_weights: false
