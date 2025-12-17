@@ -22,7 +22,6 @@ from swipealot.analysis import (
     create_single_layer_timeline_plot,
     create_summary_visualization,
     extract_path_to_char_attention,
-    extract_special_token_to_path_attention,
 )
 
 
@@ -296,17 +295,6 @@ Examples:
 
     print(f"   Extracted char→path attention for {len(all_layer_attentions)} layers")
 
-    # Extract special token→path attention for all layers
-    special_token_attentions = {"cls": {}, "sep": {}, "eos": {}}
-    for layer_idx, attn in enumerate(attentions):
-        special_tokens = extract_special_token_to_path_attention(
-            attn, path_len=path_len, word_length=len(word), aggregation=args.aggregation
-        )
-        for token_name, token_attn in special_tokens.items():
-            special_token_attentions[token_name][layer_idx] = token_attn[0].detach().cpu().numpy()
-
-    print("   Extracted special token attention (CLS, SEP, EOS) from all layers")
-
     # Also keep attention for specified layers for comparison visualization
     layer_attentions = {k: v for k, v in all_layer_attentions.items() if k in args.layers}
     print(f"   Using layers {list(layer_attentions.keys())} for layer comparison grid")
@@ -372,7 +360,6 @@ Examples:
         pooling_method=args.aggregation,
         save_path=str(timeline_path),
         path_mask=np.array(path_mask),
-        special_token_attentions=special_token_attentions,
     )
     print(f"     Saved to: {timeline_path}")
     plt.close(fig4)

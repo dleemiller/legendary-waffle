@@ -14,10 +14,7 @@ from .attention_visualizer import (
     create_layer_pooled_visualization,
     create_single_layer_timeline_plot,
     create_summary_visualization,
-    plot_attention_evolution,
     plot_attention_heatmap_on_path,
-    plot_attention_profile_1d,
-    plot_head_contribution_heatmap,
 )
 
 __all__ = [
@@ -31,9 +28,6 @@ __all__ = [
     # Visualization
     "plot_attention_heatmap_on_path",
     "create_layer_comparison_grid",
-    "plot_attention_profile_1d",
-    "plot_head_contribution_heatmap",
-    "plot_attention_evolution",
     "create_summary_visualization",
     "create_layer_pooled_visualization",
     "create_single_layer_timeline_plot",
