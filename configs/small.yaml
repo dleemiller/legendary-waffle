@@ -19,7 +19,6 @@ data:
   char_mask_prob: 0.5
   path_mask_prob: 0.5
   mask_path: true
-  batch_size: 256
   num_workers: 4
 
 training:
@@ -47,3 +46,8 @@ training:
   pairwise_modality_prob: 0.2  # 20% modality masking, 80% inverted masking
   contrastive_weight: 0.5
   contrastive_temperature: 0.1
+
+  training_args:
+    per_device_train_batch_size: 256
+    per_device_eval_batch_size: 256
+    lr_scheduler_type: "cosine"

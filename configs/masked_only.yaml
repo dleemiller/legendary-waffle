@@ -21,7 +21,6 @@ data:
   path_mask_prob: 0.0            # Disable path masking
   mask_path: false               # Disable path masking
   mask_vocab_only: true          # Only mask a-z, 0-9 (not punctuation or EOS)
-  batch_size: 512
   num_workers: 4
 
 training:
@@ -58,3 +57,8 @@ training:
   pairwise_modality_prob: 0.0
   matryoshka_dims: null
   matryoshka_weights: null
+
+  training_args:
+    per_device_train_batch_size: 512
+    per_device_eval_batch_size: 512
+    lr_scheduler_type: "cosine"
