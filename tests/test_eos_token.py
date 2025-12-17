@@ -87,12 +87,12 @@ batch_samples = [dataset[i] for i in range(4)]
 batch = collator(batch_samples)
 
 print(f"\nBatch char_labels shape: {batch['char_labels'].shape}")
-print(f"Batch char_tokens shape: {batch['char_tokens'].shape}")
+print(f"Batch input_ids shape: {batch['input_ids'].shape}")
 
 # Check if EOS tokens are in labels
 for i in range(min(2, len(batch["char_labels"]))):
     labels = batch["char_labels"][i]
-    tokens = batch["char_tokens"][i]
+    tokens = batch["input_ids"][i]
 
     # Find positions with labels (masked positions)
     masked_positions = (labels != -100).nonzero(as_tuple=True)[0]

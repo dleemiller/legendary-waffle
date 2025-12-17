@@ -33,7 +33,7 @@ def test_text_attention_zeroed_in_modality_view_when_prob_one():
 
     # View A (index 0) should have text attention zeroed and no text supervision
     attn_a = batch["attention_mask"][0]
-    char_tokens_a = batch["char_tokens"][0]
+    char_tokens_a = batch["input_ids"][0]
     char_labels_a = batch["char_labels"][0]
     char_mask_a = batch["char_mask"][0]
 
