@@ -238,13 +238,19 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
         sep_position = 1 + path_len
         pooler_output = hidden_states[:, sep_position, :]  # [batch, d_model]
 
-        # Compute loss if labels provided
+        # Compute loss if labels provided (masked-only; -100 = ignore)
         loss = None
         if char_labels is not None and self.char_head is not None:
-            loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)
             # Predict only the text segment
-            char_pred = char_logits
-            loss = loss_fct(char_pred.reshape(-1, self.config.vocab_size), char_labels.reshape(-1))
+            char_pred = char_logits  # [B, char_len, V]
+            labels_flat = char_labels.reshape(-1)
+            mask = labels_flat != -100
+            if mask.any():
+                logits_flat = char_pred.reshape(-1, self.config.vocab_size)[mask]
+                labels_flat = labels_flat[mask]
+                loss = nn.functional.cross_entropy(logits_flat, labels_flat, reduction="mean")
+            else:
+                loss = torch.tensor(0.0, device=hidden_states.device)
 
         if not return_dict:
             output = (hidden_states, char_logits, length_logits, pooler_output)
