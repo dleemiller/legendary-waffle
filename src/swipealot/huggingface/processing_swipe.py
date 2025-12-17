@@ -32,11 +32,13 @@ class SwipeProcessor(ProcessorMixin):
         max_path_len: int = 64,
         max_char_len: int = 38,
         path_input_dim: int = 6,
+        path_resample_mode: str = "time",
     ):
         self.tokenizer = tokenizer
         self.max_path_len = max_path_len
         self.max_char_len = max_char_len
         self.path_input_dim = path_input_dim
+        self.path_resample_mode = path_resample_mode
         # Attributes expected by newer transformers (not used for swipe models)
         self.chat_template = None
         self.audio_tokenizer = None
@@ -138,7 +140,9 @@ class SwipeProcessor(ProcessorMixin):
                 # Raw single path: [{"x","y","t"}, ...]
                 if isinstance(first_elem, dict) and "x" in first_elem:
                     features = normalize_and_compute_features(path_coords)
-                    path_feats, mask = sample_path_points_with_features(features, self.max_path_len)
+                    path_feats, mask = sample_path_points_with_features(
+                        features, self.max_path_len, resample_mode=self.path_resample_mode
+                    )
                     if return_tensors == "pt":
                         path_coords = torch.from_numpy(path_feats).float().unsqueeze(0)
                         _path_mask = torch.from_numpy(mask).long().unsqueeze(0)
@@ -158,7 +162,7 @@ class SwipeProcessor(ProcessorMixin):
                     for path in path_coords:
                         features = normalize_and_compute_features(path)
                         path_feats, mask = sample_path_points_with_features(
-                            features, self.max_path_len
+                            features, self.max_path_len, resample_mode=self.path_resample_mode
                         )
                         processed_paths.append(path_feats)
                         path_masks.append(mask)
@@ -200,7 +204,7 @@ class SwipeProcessor(ProcessorMixin):
                         raw = [{"x": float(p[0]), "y": float(p[1]), "t": float(p[2])} for p in path]
                         features = normalize_and_compute_features(raw)
                         path_feats, mask = sample_path_points_with_features(
-                            features, self.max_path_len
+                            features, self.max_path_len, resample_mode=self.path_resample_mode
                         )
                         processed_paths.append(path_feats)
                         path_masks.append(mask)
@@ -223,7 +227,7 @@ class SwipeProcessor(ProcessorMixin):
                         raw = [{"x": float(p[0]), "y": float(p[1]), "t": float(p[2])} for p in path]
                         features = normalize_and_compute_features(raw)
                         path_feats, mask = sample_path_points_with_features(
-                            features, self.max_path_len
+                            features, self.max_path_len, resample_mode=self.path_resample_mode
                         )
                         processed_paths.append(path_feats)
                         path_masks.append(mask)

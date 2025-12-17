@@ -19,7 +19,9 @@ class SwipeTrainer(Trainer):
     standard HuggingFace Trainer functionality.
     """
 
-    def __init__(self, loss_fn=None, eval_collator=None, **kwargs):
+    def __init__(
+        self, loss_fn=None, eval_collator=None, path_resample_mode: str = "time", **kwargs
+    ):
         """
         Initialize SwipeTrainer.
 
@@ -31,6 +33,7 @@ class SwipeTrainer(Trainer):
         super().__init__(**kwargs)
         self.loss_fn = loss_fn
         self.eval_collator = eval_collator
+        self.path_resample_mode = path_resample_mode
         self._train_collator = self.data_collator
 
     def _save(self, output_dir, state_dict=None):
@@ -69,6 +72,7 @@ class SwipeTrainer(Trainer):
                     max_path_len=self.model.config.max_path_len,
                     max_char_len=self.model.config.max_char_len,
                     path_input_dim=getattr(self.model.config, "path_input_dim", 6),
+                    path_resample_mode=self.path_resample_mode,
                 )
                 hf_processor.save_pretrained(output_dir)
         except Exception as e:

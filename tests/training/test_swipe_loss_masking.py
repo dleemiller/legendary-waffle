@@ -76,3 +76,44 @@ def test_path_loss_uses_only_masked_points():
     }
     losses0 = loss_fn(outputs, batch_none_masked)
     assert losses0["path_loss"].item() == 0.0
+
+
+def test_path_loss_dims_can_restrict_to_xy_only():
+    torch.manual_seed(0)
+    loss_fn = SwipeLoss(char_weight=0.0, path_weight=1.0, path_loss_dims=[0, 1])
+
+    batch_size = 1
+    path_len = 3
+    dim = 6
+
+    path_pred = torch.zeros(batch_size, path_len, dim, requires_grad=True)
+    path_labels = torch.zeros(batch_size, path_len, dim)
+    path_mask_indices = torch.zeros(batch_size, path_len, dtype=torch.long)
+
+    # Only index 1 is masked/supervised.
+    path_mask_indices[0, 1] = 1
+
+    # Change only non-xy dims at the supervised point: should NOT affect xy-only loss.
+    path_labels[0, 1, 2:] = torch.arange(dim - 2).float() + 10.0
+    losses = loss_fn(
+        {"path_logits": path_pred},
+        {
+            "path_coords": torch.zeros(batch_size, path_len, dim),
+            "path_labels": path_labels,
+            "path_mask_indices": path_mask_indices,
+        },
+    )
+    assert losses["path_loss"].item() == 0.0
+
+    # Now change x/y at the supervised point: should affect loss.
+    path_labels[0, 1, 0] = 0.25
+    path_labels[0, 1, 1] = 0.75
+    losses2 = loss_fn(
+        {"path_logits": path_pred},
+        {
+            "path_coords": torch.zeros(batch_size, path_len, dim),
+            "path_labels": path_labels,
+            "path_mask_indices": path_mask_indices,
+        },
+    )
+    assert losses2["path_loss"].item() > 0.0

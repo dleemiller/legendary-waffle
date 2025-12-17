@@ -2,9 +2,9 @@
 """CLI tool for generating attention visualizations on swipe paths.
 
 Usage:
-    uv run attention-map --checkpoint checkpoints/base_20251213_164813/best.pt --word-index 10
-    uv run attention-map --checkpoint checkpoints/base_20251213_164813/best.pt --word "hello"
-    uv run attention-map --checkpoint checkpoints/base_20251213_164813/best.pt --word-index 10 --layers 0 6 11
+    uv run attention-map --checkpoint checkpoints/base_20251217_113408/checkpoint-10 --word-index 10
+    uv run attention-map --checkpoint checkpoints/base_20251217_113408/checkpoint-10 --word "hello"
+    uv run attention-map --checkpoint checkpoints/base_20251217_113408/checkpoint-10 --word-index 10 --layers 0 6 11
 """
 
 import argparse
@@ -13,9 +13,9 @@ from pathlib import Path
 
 import torch
 from datasets import load_dataset
+from transformers import AutoModel, AutoProcessor
 
 from swipealot.analysis import (
-    AttentionHookManager,
     create_attention_timeline_plot,
     create_layer_comparison_grid,
     create_layer_pooled_visualization,
@@ -24,12 +24,85 @@ from swipealot.analysis import (
     extract_path_to_char_attention,
     extract_special_token_to_path_attention,
 )
-from swipealot.data import SwipeDataset
-from swipealot.data.preprocessing import (
-    normalize_and_compute_features,
-    sample_path_points_with_features,
-)
-from swipealot.models import SwipeTransformerModel
+
+
+def _get_all_layer_attentions(
+    model, inputs: dict[str, torch.Tensor]
+) -> tuple[object, tuple[torch.Tensor, ...]]:
+    with torch.no_grad():
+        outputs = model(**inputs, output_attentions=True, return_dict=True)
+
+    attentions = getattr(outputs, "attentions", None)
+    if attentions is not None:
+        return outputs, attentions
+
+    encoder = getattr(model, "encoder", None)
+    if encoder is None or not hasattr(encoder, "layers"):
+        raise RuntimeError(
+            "Model did not return `attentions` and does not expose `model.encoder.layers` "
+            "for hook-based attention extraction."
+        )
+
+    print(
+        "   Note: checkpoint remote code does not support `output_attentions`; using hook capture."
+    )
+
+    layers = list(encoder.layers)
+    buffers: list[torch.Tensor | None] = [None] * len(layers)
+    hooks = []
+    original_forwards: dict[int, callable] = {}
+
+    def make_hook(layer_idx: int):
+        def hook(_module, _inp, output):
+            if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
+                buffers[layer_idx] = output[1].detach()
+
+        return hook
+
+    def make_patched_forward(original_forward):
+        def patched_forward(
+            query,
+            key,
+            value,
+            key_padding_mask=None,
+            need_weights=True,
+            attn_mask=None,
+            average_attn_weights=False,
+            is_causal=False,
+        ):
+            return original_forward(
+                query,
+                key,
+                value,
+                key_padding_mask=key_padding_mask,
+                need_weights=True,
+                attn_mask=attn_mask,
+                average_attn_weights=False,
+                is_causal=is_causal,
+            )
+
+        return patched_forward
+
+    for idx, layer in enumerate(layers):
+        attn = layer.self_attn
+        original_forwards[idx] = attn.forward
+        attn.forward = make_patched_forward(original_forwards[idx])
+        hooks.append(attn.register_forward_hook(make_hook(idx)))
+
+    try:
+        with torch.no_grad():
+            outputs = model(**inputs, return_dict=True)
+    finally:
+        for h in hooks:
+            h.remove()
+        for idx, layer in enumerate(layers):
+            layer.self_attn.forward = original_forwards[idx]
+
+    if any(b is None for b in buffers):
+        missing = [i for i, b in enumerate(buffers) if b is None]
+        raise RuntimeError(f"Failed to capture attention weights for layers: {missing}")
+
+    return outputs, tuple(buffers)  # type: ignore[return-value]
 
 
 def main():
@@ -39,13 +112,13 @@ def main():
         epilog="""
 Examples:
   # Visualize word at index 10 from validation set
-  uv run attention-map --checkpoint checkpoints/base_20251213_164813/best.pt --word-index 10
+  uv run attention-map --checkpoint checkpoints/base_20251217_113408/checkpoint-10 --word-index 10
 
   # Visualize specific word
-  uv run attention-map --checkpoint checkpoints/base_20251213_164813/best.pt --word "hello"
+  uv run attention-map --checkpoint checkpoints/base_20251217_113408/checkpoint-10 --word "hello"
 
   # Specify custom layers and output directory
-  uv run attention-map --checkpoint checkpoints/base_20251213_164813/best.pt --word-index 5 --layers 0 6 11 --output visualizations/attention/custom
+  uv run attention-map --checkpoint checkpoints/base_20251217_113408/checkpoint-10 --word-index 5 --layers 0 6 11 --output visualizations/attention/custom
         """,
     )
 
@@ -53,7 +126,7 @@ Examples:
         "--checkpoint",
         type=str,
         required=True,
-        help="Path to model checkpoint (.pt file)",
+        help="Path to a HuggingFace checkpoint directory (e.g. .../checkpoint-10)",
     )
 
     # Word selection: either by index or by word string
@@ -100,6 +173,13 @@ Examples:
     )
 
     parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default="futo-org/swipe.futo.org",
+        help="HuggingFace dataset name (default: futo-org/swipe.futo.org)",
+    )
+
+    parser.add_argument(
         "--num-samples",
         type=int,
         default=100000,
@@ -113,6 +193,12 @@ Examples:
     if not checkpoint_path.exists():
         print(f"Error: Checkpoint not found: {checkpoint_path}", file=sys.stderr)
         sys.exit(1)
+    if not checkpoint_path.is_dir():
+        print(
+            f"Error: checkpoint must be a directory (got file): {checkpoint_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Create output directory
     output_dir = Path(args.output)
@@ -122,32 +208,19 @@ Examples:
     print("Attention Map Visualization")
     print("=" * 70)
 
-    # 1. Load checkpoint and config
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1. Load HF checkpoint (model + processor)
     print(f"\n1. Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    config = checkpoint["config"]
-
-    print(f"   Epoch: {checkpoint.get('epoch', 'N/A')}")
-    print(f"   Model: {config.model.n_layers} layers, {config.model.n_heads} heads")
-
-    # 2. Build tokenizer
-    print("\n2. Building tokenizer...")
-    sample_dataset = SwipeDataset(
-        split="train",
-        max_path_len=config.data.max_path_len,
-        max_word_len=config.data.max_char_len,
-        dataset_name=config.data.dataset_name,
-        max_samples=10000,
-    )
-    tokenizer = sample_dataset.tokenizer
-    print(f"   Vocab size: {tokenizer.vocab_size}")
-
-    # 3. Load model
-    print("\n3. Loading model...")
-    model = SwipeTransformerModel(config.model)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model = AutoModel.from_pretrained(checkpoint_path, trust_remote_code=True).to(device)
+    processor = AutoProcessor.from_pretrained(checkpoint_path, trust_remote_code=True)
     model.eval()
-    print("   Model loaded successfully")
+
+    config = model.config
+    print(f"   Model: {config.n_layers} layers, {config.n_heads} heads")
+    print(f"   Max path len: {config.max_path_len}")
+    print(f"   Max char len: {config.max_char_len}")
+    print(f"   Vocab size: {config.vocab_size}")
 
     # 4. Load sample from dataset
     print(f"\n4. Loading sample from {args.dataset_split} set...")
@@ -155,7 +228,7 @@ Examples:
     if args.word_index is not None:
         # Load specific index
         dataset = load_dataset(
-            config.data.dataset_name,
+            args.dataset_name,
             split=f"{args.dataset_split}[{args.word_index}:{args.word_index + 1}]",
         )
         if len(dataset) == 0:
@@ -172,7 +245,7 @@ Examples:
         # Search for specific word
         print(f"   Searching for word '{args.word}' in first {args.num_samples} samples...")
         dataset = load_dataset(
-            config.data.dataset_name, split=f"{args.dataset_split}[:{args.num_samples}]"
+            args.dataset_name, split=f"{args.dataset_split}[:{args.num_samples}]"
         )
 
         example = None
@@ -196,68 +269,41 @@ Examples:
     path_data = example["data"]
     print(f"   Path length: {len(path_data)} points")
 
-    processed_path = normalize_and_compute_features(path_data)
-    path_coords, path_mask = sample_path_points_with_features(
-        processed_path, config.data.max_path_len
-    )
+    inputs = processor(path_coords=path_data, text=word, return_tensors="pt")
+    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
-    # Tokenize word
-    char_tokens = tokenizer.encode(word) + [tokenizer.eos_token_id]
-    if len(char_tokens) < config.data.max_char_len:
-        char_tokens = char_tokens + [tokenizer.pad_token_id] * (
-            config.data.max_char_len - len(char_tokens)
-        )
-    else:
-        char_tokens = char_tokens[: config.data.max_char_len - 1] + [tokenizer.eos_token_id]
+    path_len = inputs["path_coords"].shape[1]
+    char_len = inputs["input_ids"].shape[1]
+    print(f"   Model path_len={path_len}, char_len={char_len}")
 
-    char_mask = [1 if token != tokenizer.pad_token_id else 0 for token in char_tokens]
+    # Extract masks for plotting
+    attn_mask = inputs["attention_mask"][0].detach().cpu()
+    path_mask = attn_mask[1 : 1 + path_len].numpy()
 
-    # Create attention mask
-    cls_mask = torch.ones(1, 1, dtype=torch.long)
-    sep_mask = torch.ones(1, 1, dtype=torch.long)
-    attention_mask = torch.cat(
-        [
-            cls_mask,
-            torch.tensor(path_mask, dtype=torch.long).unsqueeze(0),
-            sep_mask,
-            torch.tensor(char_mask, dtype=torch.long).unsqueeze(0),
-        ],
-        dim=1,
-    )
+    # 6. Extract attention from all layers (native HF output_attentions if available, else hook capture)
+    print(f"\n6. Extracting attention from all {config.n_layers} layers...")
+    outputs, attentions = _get_all_layer_attentions(model, inputs)
 
-    # Convert to tensors
-    path_coords_tensor = torch.tensor(path_coords, dtype=torch.float32).unsqueeze(0)
-    char_tokens_tensor = torch.tensor(char_tokens, dtype=torch.long).unsqueeze(0)
-
-    # 6. Extract attention from ALL layers for layer-pooled visualization
-    print("\n6. Extracting attention from all 12 layers...")
-    all_layers = list(range(config.model.n_layers))
-    hook_manager_all = AttentionHookManager(model, target_layers=all_layers)
-
-    attention_weights_all = hook_manager_all.extract_attention(
-        path_coords=path_coords_tensor,
-        char_tokens=char_tokens_tensor,
-        attention_mask=attention_mask,
-    )
-
-    # Extract char→path attention with specified aggregation for all layers
+    # Extract char→path attention with specified head aggregation for all layers
     all_layer_attentions = {}
-    for layer_idx, attn in attention_weights_all.items():
-        char_to_path = extract_path_to_char_attention(attn, aggregation=args.aggregation)
-        all_layer_attentions[layer_idx] = char_to_path[0].cpu().numpy()  # Remove batch dim
+    for layer_idx, attn in enumerate(attentions):
+        char_to_path = extract_path_to_char_attention(
+            attn, path_len=path_len, char_len=char_len, aggregation=args.aggregation
+        )[0]  # remove batch dim
+        # Restrict to actual characters in the provided word (exclude EOS + padding)
+        n_chars = min(len(word), char_len)
+        all_layer_attentions[layer_idx] = char_to_path[:n_chars].detach().cpu().numpy()
 
-    print(f"   Extracted attention from all {len(all_layer_attentions)} layers")
+    print(f"   Extracted char→path attention for {len(all_layer_attentions)} layers")
 
     # Extract special token→path attention for all layers
     special_token_attentions = {"cls": {}, "sep": {}, "eos": {}}
-    for layer_idx, attn in attention_weights_all.items():
+    for layer_idx, attn in enumerate(attentions):
         special_tokens = extract_special_token_to_path_attention(
-            attn, word_length=len(word), aggregation=args.aggregation
+            attn, path_len=path_len, word_length=len(word), aggregation=args.aggregation
         )
         for token_name, token_attn in special_tokens.items():
-            special_token_attentions[token_name][layer_idx] = (
-                token_attn[0].cpu().numpy()
-            )  # Remove batch dim
+            special_token_attentions[token_name][layer_idx] = token_attn[0].detach().cpu().numpy()
 
     print("   Extracted special token attention (CLS, SEP, EOS) from all layers")
 
@@ -277,7 +323,7 @@ Examples:
 
     fig1 = create_layer_comparison_grid(
         layer_attentions=layer_attentions,
-        path_coords=path_coords,
+        path_coords=inputs["path_coords"][0].detach().cpu().numpy(),
         word=word,
         char_indices=list(range(n_chars)),
         save_path=str(grid_path),
@@ -294,7 +340,7 @@ Examples:
     summary_path = output_dir / f"{word}_summary.png"
     fig2 = create_summary_visualization(
         layer_attentions=layer_attentions,
-        path_coords=path_coords,
+        path_coords=inputs["path_coords"][0].detach().cpu().numpy(),
         word=word,
         save_path=str(summary_path),
         path_mask=np.array(path_mask),
@@ -307,7 +353,7 @@ Examples:
     pooled_path = output_dir / f"{word}_layer_pooled_{args.aggregation}.png"
     fig3 = create_layer_pooled_visualization(
         layer_attentions=all_layer_attentions,
-        path_coords=path_coords,
+        path_coords=inputs["path_coords"][0].detach().cpu().numpy(),
         word=word,
         pooling_method=args.aggregation,
         save_path=str(pooled_path),
@@ -321,7 +367,7 @@ Examples:
     timeline_path = output_dir / f"{word}_timeline_{args.aggregation}.png"
     fig4 = create_attention_timeline_plot(
         layer_attentions=all_layer_attentions,
-        path_coords=path_coords,
+        path_coords=inputs["path_coords"][0].detach().cpu().numpy(),
         word=word,
         pooling_method=args.aggregation,
         save_path=str(timeline_path),
@@ -341,7 +387,7 @@ Examples:
         fig_layer = create_single_layer_timeline_plot(
             layer_attention=layer_attn,
             layer_idx=layer_idx,
-            path_coords=path_coords,
+            path_coords=inputs["path_coords"][0].detach().cpu().numpy(),
             word=word,
             save_path=str(per_layer_path),
             path_mask=np.array(path_mask),

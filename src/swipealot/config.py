@@ -46,10 +46,12 @@ class DataConfig:
     # Data processing
     max_path_len: int = 64
     max_char_len: int = 38
+    path_resample_mode: str = "time"  # "time" (dwell-aware) or "spatial" (distance-uniform)
 
     # Masking strategy
     char_mask_prob: Any = 0.15  # Float or [min, max] range for random masking
     path_mask_prob: float = 0.15
+    path_mask_block_max_len: int = 32  # Max contiguous masked block length
     mask_path: bool = True
     mask_vocab_only: bool = False  # Only mask vocabulary tokens (a-z, 0-9)
 
@@ -66,6 +68,7 @@ class TrainingConfig:
     char_loss_weight: float = 1.0
     path_loss_weight: float = 0.1
     length_loss_weight: float = 0.1  # Auxiliary CLS length prediction
+    path_loss_dims: list[int] | None = None  # e.g. [0,1] to supervise x/y only
 
     # Custom loss settings
     use_focal_loss: bool = False

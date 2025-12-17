@@ -137,6 +137,7 @@ def main():
         tokenizer=tokenizer,
         dataset_name=config.data.dataset_name,
         max_samples=max_samples,
+        path_resample_mode=config.data.path_resample_mode,
     )
 
     val_dataset = SwipeDataset(
@@ -146,6 +147,7 @@ def main():
         tokenizer=tokenizer,
         dataset_name=config.data.dataset_name,
         max_samples=max_samples // 10 if max_samples else 1000,  # Use 1k samples for validation
+        path_resample_mode=config.data.path_resample_mode,
     )
 
     logger.info(f"Train samples: [green]{len(train_dataset):,}[/green]")
@@ -159,6 +161,7 @@ def main():
             mask_path=config.data.mask_path,
             modality_prob=config.training.pairwise_modality_prob,
             zero_attention_prob=config.training.pairwise_zero_attention_prob,
+            path_mask_block_max_len=config.data.path_mask_block_max_len,
             inverted_char_prob_heavy=config.training.pairwise_inverted_char_prob_heavy,
             inverted_path_prob_heavy=config.training.pairwise_inverted_path_prob_heavy,
             inverted_char_prob_light=config.training.pairwise_inverted_char_prob_light,
@@ -182,6 +185,7 @@ def main():
             path_mask_prob=config.data.path_mask_prob,
             mask_path=config.data.mask_path,
             mask_vocab_only=config.data.mask_vocab_only,
+            path_mask_block_max_len=config.data.path_mask_block_max_len,
         )
         val_collator = train_collator
         logger.info("Using standard masked collator")
@@ -225,6 +229,7 @@ def main():
         char_weight=config.training.char_loss_weight,
         path_weight=config.training.path_loss_weight,
         length_weight=config.training.length_loss_weight,
+        path_loss_dims=config.training.path_loss_dims,
         focal_gamma=config.training.focal_gamma if config.training.use_focal_loss else 0.0,
         char_class_weights=char_freq_weights,
         contrastive_weight=config.training.contrastive_weight,
@@ -285,6 +290,7 @@ def main():
         eval_collator=val_collator,  # Use separate collator for evaluation
         compute_metrics=compute_metrics,
         loss_fn=loss_fn,
+        path_resample_mode=config.data.path_resample_mode,
     )
 
     # Resume from checkpoint if specified
@@ -324,6 +330,8 @@ def main():
         tokenizer=hf_tokenizer,
         max_path_len=config.data.max_path_len,
         max_char_len=config.data.max_char_len,
+        path_input_dim=config.model.path_input_dim,
+        path_resample_mode=config.data.path_resample_mode,
     )
     hf_processor.save_pretrained(final_path)
     logger.info("  [green]✓[/green] Saved processor with auto_map")

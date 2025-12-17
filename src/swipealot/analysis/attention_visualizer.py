@@ -16,6 +16,50 @@ sns.set_context("notebook", font_scale=1.0)
 sns.set_style("whitegrid")
 
 
+def _filter_path_points(
+    path_coords: np.ndarray, path_mask: np.ndarray | None
+) -> tuple[np.ndarray, np.ndarray]:
+    if path_mask is None:
+        return path_coords, np.arange(len(path_coords))
+    valid_indices = np.where(path_mask == 1)[0]
+    return path_coords[valid_indices], valid_indices
+
+
+def _infer_time_axis(path_coords: np.ndarray) -> tuple[np.ndarray, str]:
+    """Infer a sensible x-axis for timeline plots.
+
+    Supported path formats:
+    - [n, 3]: (x, y, t) where t may be unix time or relative time.
+    - [n, 6]: (x, y, dx, dy, ds, log1p(dt)) => time is cumulative expm1(log1p(dt)).
+    - [n, 2] or other: fall back to path position index.
+    """
+    if path_coords.ndim != 2:
+        raise ValueError(f"path_coords must be 2D, got shape {path_coords.shape}")
+
+    n_points, d = path_coords.shape
+    if n_points == 0:
+        return np.array([]), "Time"
+
+    # Engineered features: (x, y, dx, dy, ds, log1p(dt))
+    if d >= 6:
+        log1dt = path_coords[:, 5]
+        dt = np.expm1(log1dt)
+        dt = np.clip(dt, 0.0, None)
+        times = np.cumsum(dt)
+        return times, "Time (cumulative dt)"
+
+    # Raw (x, y, t)
+    if d >= 3:
+        t = path_coords[:, 2]
+        # If it looks like unix time, convert to relative seconds
+        if np.nanmedian(t) > 1e8:
+            t0 = t[0]
+            return t - t0, "Time (relative)"
+        return t, "Time"
+
+    return np.arange(n_points), "Path position"
+
+
 def plot_attention_heatmap_on_path(
     ax: plt.Axes,
     path_coords: np.ndarray,
@@ -31,7 +75,7 @@ def plot_attention_heatmap_on_path(
 
     Args:
         ax: Matplotlib 3D axes to plot on
-        path_coords: Path coordinates [n_path_points, 3] (x, y, t)
+        path_coords: Path coordinates [n_path_points, *] (supports raw [n,3] or engineered [n,6])
         attention: Attention weights [n_chars, n_path_points]
         char_idx: Index of character to visualize (0 to n_chars-1)
         word: The target word
@@ -40,20 +84,14 @@ def plot_attention_heatmap_on_path(
         global_vmin: Global minimum for color normalization (optional)
         global_vmax: Global maximum for color normalization (optional)
     """
-    # Filter to only valid path points if mask is provided
-    if path_mask is not None:
-        valid_indices = np.where(path_mask == 1)[0]
-        path_coords = path_coords[valid_indices]
-        # Also filter attention to match
-        char_attention_full = attention[char_idx, :]
-        char_attention = char_attention_full[valid_indices]
-    else:
-        char_attention = attention[char_idx, :]
+    path_coords_filtered, valid_indices = _filter_path_points(path_coords, path_mask)
+    char_attention_full = attention[char_idx, :]
+    char_attention = char_attention_full[valid_indices]
 
-    # Extract x, y, t coordinates
-    xs = path_coords[:, 0]
-    ys = path_coords[:, 1]
-    ts = path_coords[:, 2]
+    # Extract x, y coordinates and infer time axis
+    xs = path_coords_filtered[:, 0]
+    ys = path_coords_filtered[:, 1]
+    ts, time_label = _infer_time_axis(path_coords_filtered)
 
     # Use global normalization if provided, otherwise normalize per-plot
     if global_vmin is not None and global_vmax is not None:
@@ -132,7 +170,7 @@ def plot_attention_heatmap_on_path(
     # 3D axis labels
     ax.set_xlabel("X", fontsize=9, labelpad=10)
     ax.set_ylabel("Y", fontsize=9, labelpad=10)
-    ax.set_zlabel("Time", fontsize=9, labelpad=10)
+    ax.set_zlabel(time_label, fontsize=9, labelpad=10)
 
     # Set axis limits
     ax.set_xlim(0, 1)
@@ -179,7 +217,7 @@ def create_layer_comparison_grid(
 
     Args:
         layer_attentions: Dict mapping layer_idx -> attention [n_chars, n_path_points]
-        path_coords: Path coordinates [n_path_points, 3]
+        path_coords: Path coordinates [n_path_points, *]
         word: Target word
         char_indices: Which characters to visualize (default: first 5 or all if word is short)
         figsize: Figure size (default: auto-calculated)
@@ -525,7 +563,7 @@ def create_layer_pooled_visualization(
 
     Args:
         layer_attentions: Dict mapping layer_idx -> attention [n_chars, n_path_points]
-        path_coords: Path coordinates [n_path_points, 3]
+        path_coords: Path coordinates [n_path_points, *]
         word: Target word
         pooling_method: How layers were pooled ("max", "mean", or "sum")
         save_path: Optional save path
@@ -618,7 +656,7 @@ def create_single_layer_timeline_plot(
     Args:
         layer_attention: Attention for single layer [n_chars, n_path_points]
         layer_idx: Index of the layer
-        path_coords: Path coordinates [n_path_points, 3] (x, y, t)
+        path_coords: Path coordinates [n_path_points, *] (supports raw [n,3] or engineered [n,6])
         word: Target word
         save_path: Optional save path
         path_mask: Optional mask indicating valid path points
@@ -626,18 +664,10 @@ def create_single_layer_timeline_plot(
     Returns:
         Matplotlib figure
     """
-    # Filter path coords if mask provided
-    if path_mask is not None:
-        valid_indices = np.where(path_mask == 1)[0]
-        path_coords_filtered = path_coords[valid_indices]
-        layer_attention_filtered = layer_attention[:, valid_indices]
-    else:
-        path_coords_filtered = path_coords
-        layer_attention_filtered = layer_attention
-        valid_indices = np.arange(len(path_coords))
+    path_coords_filtered, valid_indices = _filter_path_points(path_coords, path_mask)
+    layer_attention_filtered = layer_attention[:, valid_indices]
 
-    # Extract time values
-    times = path_coords_filtered[:, 2]
+    times, time_label = _infer_time_axis(path_coords_filtered)
 
     # Create figure
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -692,7 +722,7 @@ def create_single_layer_timeline_plot(
     )
 
     # Formatting
-    ax.set_xlabel("Time", fontsize=12, fontweight="bold")
+    ax.set_xlabel(time_label, fontsize=12, fontweight="bold")
     ax.set_ylabel("Attention Score", fontsize=12, fontweight="bold")
     ax.set_title(
         f'Attention Timeline: "{word}" (Layer {layer_idx})', fontsize=14, fontweight="bold", pad=20
@@ -722,7 +752,7 @@ def create_attention_timeline_plot(
 
     Args:
         layer_attentions: Dict mapping layer_idx -> attention [n_chars, n_path_points]
-        path_coords: Path coordinates [n_path_points, 3] (x, y, t)
+        path_coords: Path coordinates [n_path_points, *] (supports raw [n,3] or engineered [n,6])
         word: Target word
         pooling_method: How layers were pooled ("max", "mean", or "sum")
         save_path: Optional save path
@@ -733,16 +763,9 @@ def create_attention_timeline_plot(
     Returns:
         Matplotlib figure
     """
-    # Filter path coords if mask provided
-    if path_mask is not None:
-        valid_indices = np.where(path_mask == 1)[0]
-        path_coords_filtered = path_coords[valid_indices]
-    else:
-        path_coords_filtered = path_coords
-        valid_indices = np.arange(len(path_coords))
+    path_coords_filtered, valid_indices = _filter_path_points(path_coords, path_mask)
 
-    # Extract time values
-    times = path_coords_filtered[:, 2]
+    times, time_label = _infer_time_axis(path_coords_filtered)
 
     # Pool attention across all layers
     attention_stack = np.stack([attn for attn in layer_attentions.values()], axis=0)
@@ -902,7 +925,7 @@ def create_attention_timeline_plot(
     )
 
     # Formatting
-    ax.set_xlabel("Time", fontsize=12, fontweight="bold")
+    ax.set_xlabel(time_label, fontsize=12, fontweight="bold")
     ax.set_ylabel("Attention Score", fontsize=12, fontweight="bold")
     ax.set_title(
         f'Attention Timeline: "{word}" ({pooling_method.capitalize()} across {len(layer_attentions)} layers)',

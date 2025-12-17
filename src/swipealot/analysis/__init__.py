@@ -2,6 +2,7 @@
 
 from .attention_extractor import (
     AttentionHookManager,
+    compute_char_to_path_attention_profile,
     extract_path_to_char_attention,
     extract_special_token_to_path_attention,
     get_attention_statistics,
@@ -22,6 +23,7 @@ from .attention_visualizer import (
 __all__ = [
     # Extraction
     "AttentionHookManager",
+    "compute_char_to_path_attention_profile",
     "extract_path_to_char_attention",
     "extract_special_token_to_path_attention",
     "identify_dominant_head",

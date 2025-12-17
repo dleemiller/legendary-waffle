@@ -25,6 +25,7 @@ dependencies = [
 train = "swipealot.scripts.train:main"
 evaluate = "swipealot.scripts.evaluate:main"
 attention-map = "swipealot.scripts.attention_map:main"
+attention-grid = "swipealot.scripts.attention_grid:main"
 validate = "swipealot.scripts.validate:main"
 
 [project.optional-dependencies]
