@@ -2,7 +2,6 @@
 
 from .configuration_swipe import SwipeTransformerConfig
 from .modeling_swipe import (
-    SwipeModel,
     SwipeTransformerModel,
     SwipeTransformerPreTrainedModel,
 )
@@ -13,7 +12,6 @@ __all__ = [
     "SwipeTransformerConfig",
     "SwipeTransformerModel",
     "SwipeTransformerPreTrainedModel",
-    "SwipeModel",
     "SwipeTokenizer",
     "SwipeProcessor",
 ]

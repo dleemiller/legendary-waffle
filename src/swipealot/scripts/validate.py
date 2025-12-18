@@ -1,13 +1,7 @@
-"""
-Test HuggingFace converted models for functionality and performance.
+"""Validate a HuggingFace SwipeALot checkpoint via the customer-facing APIs.
 
-Tests:
-- Embedding model: similarity matrix, ranking accuracy
-- Base model: length prediction, masked character prediction
-
-Usage:
-    uv run test-hf --model ./hf_embedding --model-type embedding --n-samples 1000
-    uv run test-hf --model ./hf_base --model-type base --n-samples 1000
+This script loads checkpoints using `AutoModel` / `AutoProcessor` with `trust_remote_code=True`
+so the results reflect what will run when the checkpoint is exported / uploaded.
 """
 
 import argparse
@@ -44,149 +38,11 @@ def load_model_and_processor(model_path: Path):
     return model, processor, device
 
 
-def test_embedding_similarity(model, processor, device, dataset_name: str, n_samples: int = 1000):
-    """
-    Test embedding model with similarity matrix.
-
-    For each path, compute embeddings for the correct word and distractor words,
-    then check if the correct word has the highest similarity.
-    """
-    print(f"\n{'=' * 60}")
-    print("Testing Embedding Similarity")
-    print(f"{'=' * 60}\n")
-
-    # Load test data
-    print(f"Loading dataset: {dataset_name}")
-    test_data = load_dataset(dataset_name, split=f"test[:{n_samples}]")
-    print(f"  ✓ Loaded {len(test_data)} samples")
-
-    # Prepare test samples
-    samples = []
-    for item in test_data:
-        samples.append(
-            {
-                "path": item["data"],
-                "word": item["word"],
-                "candidates": item.get("candidates", [item["word"]]),
-            }
-        )
-
-    # Compute embeddings and similarities
-    print("\nComputing embeddings and similarities...")
-    top1_correct = 0
-    top3_correct = 0
-    top5_correct = 0
-    all_ranks = []
-    similarity_scores = []
-
-    with torch.no_grad():
-        for sample in tqdm(samples, desc="Testing"):
-            path = sample["path"]
-            word = sample["word"]
-            candidates = sample["candidates"] if len(sample["candidates"]) > 1 else [word]
-
-            # Add some random distractors if candidates list is small
-            if len(candidates) < 10:
-                # Sample some random words from dataset
-                random_indices = np.random.choice(len(test_data), size=10, replace=False)
-                for idx in random_indices:
-                    distractor = test_data[int(idx)]["word"]
-                    if distractor != word and distractor not in candidates:
-                        candidates.append(distractor)
-
-            # Ensure correct word is in candidates
-            if word not in candidates:
-                candidates.insert(0, word)
-
-            # Get path embedding (path-only)
-            path_input = processor(path_coords=path, text=None, return_tensors="pt")
-            path_input = {k: v.to(device) for k, v in path_input.items()}
-            path_output = model(**path_input)
-            path_embedding = path_output.pooler_output  # [1, d_model]
-
-            # Get candidate embeddings
-            candidate_embeddings = []
-            for candidate in candidates:
-                cand_input = processor(path_coords=path, text=candidate, return_tensors="pt")
-                cand_input = {k: v.to(device) for k, v in cand_input.items()}
-                cand_output = model(**cand_input)
-                cand_embedding = cand_output.pooler_output  # [1, d_model]
-                candidate_embeddings.append(cand_embedding)
-
-            # Stack candidate embeddings
-            candidate_embeddings = torch.cat(candidate_embeddings, dim=0)  # [n_candidates, d_model]
-
-            # Compute cosine similarity
-            path_embedding_norm = torch.nn.functional.normalize(path_embedding, p=2, dim=1)
-            candidate_embeddings_norm = torch.nn.functional.normalize(
-                candidate_embeddings, p=2, dim=1
-            )
-            similarities = torch.matmul(
-                path_embedding_norm, candidate_embeddings_norm.T
-            ).squeeze()  # [n_candidates]
-
-            # Find rank of correct word
-            sorted_indices = torch.argsort(similarities, descending=True)
-            correct_idx = candidates.index(word)
-            rank = (sorted_indices == correct_idx).nonzero(as_tuple=True)[0].item() + 1
-
-            all_ranks.append(rank)
-            similarity_scores.append(similarities[correct_idx].item())
-
-            # Check top-k accuracy
-            if rank == 1:
-                top1_correct += 1
-            if rank <= 3:
-                top3_correct += 1
-            if rank <= 5:
-                top5_correct += 1
-
-    # Compute metrics
-    n_samples_tested = len(samples)
-    top1_acc = top1_correct / n_samples_tested
-    top3_acc = top3_correct / n_samples_tested
-    top5_acc = top5_correct / n_samples_tested
-    mean_rank = np.mean(all_ranks)
-    median_rank = np.median(all_ranks)
-    mean_similarity = np.mean(similarity_scores)
-
-    print("\n" + "=" * 60)
-    print("Embedding Similarity Results")
-    print("=" * 60)
-    print(f"Samples tested: {n_samples_tested}")
-    print(f"\nTop-1 Accuracy: {top1_acc:.4f} ({top1_correct}/{n_samples_tested})")
-    print(f"Top-3 Accuracy: {top3_acc:.4f} ({top3_correct}/{n_samples_tested})")
-    print(f"Top-5 Accuracy: {top5_acc:.4f} ({top5_correct}/{n_samples_tested})")
-    print(f"\nMean Rank: {mean_rank:.2f}")
-    print(f"Median Rank: {median_rank:.1f}")
-    print(f"Mean Similarity (correct): {mean_similarity:.4f}")
-
-    # Plot rank distribution
-    plt.figure(figsize=(10, 6))
-    plt.hist(all_ranks, bins=50, edgecolor="black", alpha=0.7)
-    plt.xlabel("Rank of Correct Word")
-    plt.ylabel("Frequency")
-    plt.title("Distribution of Correct Word Ranks")
-    plt.axvline(mean_rank, color="red", linestyle="--", label=f"Mean: {mean_rank:.2f}")
-    plt.axvline(median_rank, color="green", linestyle="--", label=f"Median: {median_rank:.1f}")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("embedding_rank_distribution.png", dpi=150)
-    print("\n  ✓ Saved rank distribution plot to embedding_rank_distribution.png")
-
-    return {
-        "top1_accuracy": top1_acc,
-        "top3_accuracy": top3_acc,
-        "top5_accuracy": top5_acc,
-        "mean_rank": mean_rank,
-        "median_rank": median_rank,
-        "mean_similarity": mean_similarity,
-    }
-
-
 def test_length_prediction(model, processor, device, dataset_name: str, n_samples: int = 1000):
     """
-    Test base model's ability to predict word length from path.
+    Test the model's ability to predict word length from path.
+
+    The current architecture predicts length as a scalar regression output (`length_logits: [batch]`).
     """
     print(f"\n{'=' * 60}")
     print("Testing Length Prediction")
@@ -220,24 +76,22 @@ def test_length_prediction(model, processor, device, dataset_name: str, n_sample
                 print("  ✗ Model does not have length prediction capability")
                 return None
 
-            # Get predicted length
-            length_logits = outputs.length_logits  # [batch, max_length+1]
-            predicted_length = length_logits.argmax(dim=-1).item()
-
-            predicted_lengths.append(predicted_length)
-            true_lengths.append(true_length)
+            pred_len = float(outputs.length_logits.reshape(-1)[0].item())
+            predicted_lengths.append(pred_len)
+            true_lengths.append(float(true_length))
 
     # Compute metrics
-    predicted_lengths = np.array(predicted_lengths)
-    true_lengths = np.array(true_lengths)
+    predicted_lengths = np.array(predicted_lengths, dtype=np.float64)
+    true_lengths = np.array(true_lengths, dtype=np.float64)
 
-    exact_accuracy = accuracy_score(true_lengths, predicted_lengths)
-    mae = np.mean(np.abs(predicted_lengths - true_lengths))
-    rmse = np.sqrt(np.mean((predicted_lengths - true_lengths) ** 2))
+    err = predicted_lengths - true_lengths
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(err**2)))
 
-    # Within-k accuracy
-    within_1 = np.mean(np.abs(predicted_lengths - true_lengths) <= 1)
-    within_2 = np.mean(np.abs(predicted_lengths - true_lengths) <= 2)
+    pred_round = np.round(predicted_lengths).clip(min=0.0)
+    exact_accuracy = float(accuracy_score(true_lengths.astype(int), pred_round.astype(int)))
+    within_1 = float(np.mean(np.abs(pred_round - true_lengths) <= 1))
+    within_2 = float(np.mean(np.abs(pred_round - true_lengths) <= 2))
 
     print("\n" + "=" * 60)
     print("Length Prediction Results")
@@ -249,11 +103,13 @@ def test_length_prediction(model, processor, device, dataset_name: str, n_sample
     print(f"\nMAE: {mae:.4f}")
     print(f"RMSE: {rmse:.4f}")
 
-    # Plot confusion matrix (for lengths up to 15)
-    max_len = min(15, max(max(true_lengths), max(predicted_lengths)))
-    mask = (true_lengths <= max_len) & (predicted_lengths <= max_len)
+    # Plot confusion matrix (rounded predictions; for lengths up to 15)
+    max_len = int(min(15, max(max(true_lengths), max(pred_round))))
+    mask = (true_lengths <= max_len) & (pred_round <= max_len)
     cm = confusion_matrix(
-        true_lengths[mask], predicted_lengths[mask], labels=list(range(max_len + 1))
+        true_lengths[mask].astype(int),
+        pred_round[mask].astype(int),
+        labels=list(range(max_len + 1)),
     )
 
     plt.figure(figsize=(12, 10))
@@ -747,18 +603,15 @@ def test_path_reconstruction(model, processor, device, dataset_name: str, n_samp
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Test HuggingFace converted models",
+        description="Validate SwipeALot HuggingFace checkpoints",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Test embedding model
-  uv run test-hf --model ./hf_embedding --model-type embedding --n-samples 1000
+  # Run all applicable checks
+  uv run validate --model checkpoints/.../final --n-samples 1000
 
-  # Test base model (all tests)
-  uv run test-hf --model ./hf_base --model-type base --n-samples 1000
-
-  # Test specific functionality
-  uv run test-hf --model ./hf_base --model-type base --test length --n-samples 500
+  # Run just length evaluation
+  uv run validate --model checkpoints/.../final --test length --n-samples 500
         """,
     )
 
@@ -766,16 +619,9 @@ Examples:
         "--model", type=str, required=True, help="Path to HuggingFace model directory"
     )
     parser.add_argument(
-        "--model-type",
-        type=str,
-        choices=["auto", "base", "embedding"],
-        default="auto",
-        help="Model type (default: auto-detect)",
-    )
-    parser.add_argument(
         "--test",
         type=str,
-        choices=["all", "similarity", "length", "masked", "reconstruction", "path"],
+        choices=["all", "length", "masked", "reconstruction", "path"],
         default="all",
         help="Which test to run (default: all applicable tests)",
     )
@@ -799,54 +645,38 @@ Examples:
 
     model, processor, device = load_model_and_processor(model_path)
 
-    # Detect model type if auto
-    model_type = args.model_type
-    if model_type == "auto":
-        # Check if model has prediction heads
-        if hasattr(model, "char_head"):
-            model_type = "base"
-            print("  Auto-detected: base model (has prediction heads)")
-        else:
-            model_type = "embedding"
-            print("  Auto-detected: embedding model (no prediction heads)")
-
     # Run tests
     results = {}
 
-    if model_type == "embedding":
-        if args.test in ["all", "similarity"]:
-            results["similarity"] = test_embedding_similarity(
-                model, processor, device, args.dataset, args.n_samples
-            )
+    if args.test in ["all", "length"] and bool(getattr(model.config, "predict_length", False)):
+        length_results = test_length_prediction(
+            model, processor, device, args.dataset, args.n_samples
+        )
+        if length_results:
+            results["length"] = length_results
 
-    elif model_type == "base":
-        if args.test in ["all", "length"]:
-            length_results = test_length_prediction(
-                model, processor, device, args.dataset, args.n_samples
-            )
-            if length_results:
-                results["length"] = length_results
+    if args.test in ["all", "masked"] and bool(getattr(model.config, "predict_char", False)):
+        masked_results = test_masked_prediction(
+            model, processor, device, args.dataset, args.n_samples
+        )
+        if masked_results:
+            results["masked"] = masked_results
 
-        if args.test in ["all", "masked"]:
-            masked_results = test_masked_prediction(
-                model, processor, device, args.dataset, args.n_samples
-            )
-            if masked_results:
-                results["masked"] = masked_results
+    if args.test in ["all", "reconstruction"] and bool(
+        getattr(model.config, "predict_char", False)
+    ):
+        reconstruction_results = test_full_reconstruction(
+            model, processor, device, args.dataset, args.n_samples
+        )
+        if reconstruction_results:
+            results["reconstruction"] = reconstruction_results
 
-        if args.test in ["all", "reconstruction"]:
-            reconstruction_results = test_full_reconstruction(
-                model, processor, device, args.dataset, args.n_samples
-            )
-            if reconstruction_results:
-                results["reconstruction"] = reconstruction_results
-
-        if args.test in ["all", "path"]:
-            path_results = test_path_reconstruction(
-                model, processor, device, args.dataset, args.n_samples
-            )
-            if path_results:
-                results["path"] = path_results
+    if args.test in ["all", "path"] and bool(getattr(model.config, "predict_path", False)):
+        path_results = test_path_reconstruction(
+            model, processor, device, args.dataset, args.n_samples
+        )
+        if path_results:
+            results["path"] = path_results
 
     # Save results summary
     if results:
