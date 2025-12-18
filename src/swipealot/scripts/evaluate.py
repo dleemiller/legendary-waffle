@@ -1,338 +1,316 @@
-"""Evaluation script for swipe keyboard model."""
+"""Evaluate a HuggingFace SwipeALot checkpoint via the customer-facing APIs.
+
+This script intentionally loads the checkpoint using:
+- `AutoModel.from_pretrained(..., trust_remote_code=True)`
+- `AutoProcessor.from_pretrained(..., trust_remote_code=True)`
+
+so evaluation reflects how the model will be used after export.
+"""
+
+from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
 
-import matplotlib.pyplot as plt
+import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from datasets import load_dataset
 from tqdm import tqdm
-
-from swipealot.data import SwipeDataset, ValidationCollator
-from swipealot.models import SwipeTransformerModel
-from swipealot.training import CharacterAccuracy, WordAccuracy
-from swipealot.utils import batch_to_device, extract_character_logits
+from transformers import AutoModel, AutoProcessor
 
 
-def evaluate_model(model, test_loader, tokenizer, device):
-    """
-    Evaluate model on test set.
+def _swipable_length(word: str) -> int:
+    """Match training: count only alphanumeric characters (letters + digits)."""
+    return sum(1 for c in word.lower() if c.isalpha() or c.isdigit())
 
-    Args:
-        model: Trained model
-        test_loader: Test data loader
-        tokenizer: Character tokenizer
-        device: Device to run on
 
-    Returns:
-        Dictionary of metrics, predictions, targets, and sample data
-    """
+@dataclass
+class MaskedEvalResult:
+    masked_token_accuracy: float
+    masked_token_count: int
+    word_accuracy: float
+    word_count: int
+
+
+@dataclass
+class LengthEvalResult:
+    mae: float
+    rmse: float
+    acc_exact_rounded: float
+    acc_within_1: float
+    acc_within_2: float
+    count: int
+
+
+def _iter_batches(items: list[dict], batch_size: int) -> Iterable[list[dict]]:
+    for i in range(0, len(items), batch_size):
+        yield items[i : i + batch_size]
+
+
+def evaluate_masked_tokens(
+    *,
+    model,
+    processor,
+    dataset_items: list[dict],
+    device: torch.device,
+    batch_size: int,
+    mask_mode: str,
+    mask_prob: float,
+    mask_eos: bool,
+    seed: int,
+) -> MaskedEvalResult:
+    tokenizer = processor.tokenizer
+    pad_id = int(tokenizer.pad_token_id)
+    mask_id = int(tokenizer.mask_token_id)
+    eos_id = int(getattr(tokenizer, "eos_token_id", -1))
+
+    rng = torch.Generator(device="cpu")
+    rng.manual_seed(int(seed))
+
+    masked_correct = 0
+    masked_total = 0
+    word_correct = 0
+    word_total = 0
+
     model.eval()
-
-    char_accuracy = CharacterAccuracy(vocab_size=tokenizer.vocab_size, device=str(device))
-    word_accuracy = WordAccuracy(tokenizer)
-
-    all_predictions = []
-    all_targets = []
-    all_samples = []  # Store (path_coords, target, prediction) tuples
-
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Evaluating"):
-            # Move to device
-            batch = batch_to_device(batch, device)
+        for batch in tqdm(
+            _iter_batches(dataset_items, batch_size),
+            total=(len(dataset_items) + batch_size - 1) // batch_size,
+            desc="Masked token eval",
+        ):
+            words = [ex["word"] for ex in batch]
+            paths = [ex["data"] for ex in batch]
 
-            # Forward pass
+            inputs = processor(path_coords=paths, text=words, return_tensors="pt")
+            inputs = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()
+            }
+
+            input_ids = inputs["input_ids"]  # [B, char_len]
+            labels = input_ids.clone()
+
+            maskable = input_ids.ne(pad_id)
+            if not mask_eos and eos_id >= 0:
+                maskable = maskable & input_ids.ne(eos_id)
+
+            if mask_mode == "none":
+                masked_positions = torch.zeros_like(maskable, dtype=torch.bool)
+            elif mask_mode == "all":
+                masked_positions = maskable
+            elif mask_mode == "random":
+                r = torch.rand(maskable.shape, generator=rng, device="cpu")
+                masked_positions = (r < float(mask_prob)) & maskable.cpu()
+                masked_positions = masked_positions.to(device)
+            else:
+                raise ValueError(f"Unknown mask_mode: {mask_mode}")
+
+            labels[~masked_positions] = -100
+            masked_input_ids = input_ids.clone()
+            masked_input_ids[masked_positions] = mask_id
+
             outputs = model(
-                path_coords=batch["path_coords"],
-                char_tokens=batch["char_tokens"],
-                attention_mask=batch["attention_mask"],
+                path_coords=inputs["path_coords"],
+                input_ids=masked_input_ids,
+                attention_mask=inputs.get("attention_mask"),
+                labels=labels,
+                return_dict=True,
             )
+            logits = outputs.char_logits  # [B, char_len, V] (text segment only)
+            if logits is None:
+                raise RuntimeError("Model did not return `char_logits`; is predict_char disabled?")
 
-            # Extract character predictions
-            char_logits = outputs["char_logits"]
-            path_len = batch["path_coords"].shape[1]
-            char_logits_subset = extract_character_logits(
-                char_logits, path_len, batch["char_tokens"].shape[1]
-            )
+            preds = logits.argmax(dim=-1)
+            masked = labels.ne(-100)
+            if masked.any():
+                masked_correct += int((preds[masked] == labels[masked]).sum().item())
+                masked_total += int(masked.sum().item())
 
-            # Get predictions
-            pred_tokens = char_logits_subset.argmax(dim=-1)
+            # Word accuracy: decode the full prediction up to EOS of the *target* sequence.
+            preds_cpu = preds.detach().cpu().numpy()
+            input_ids_cpu = input_ids.detach().cpu().numpy()
+            for i, target_word in enumerate(words):
+                target_ids = input_ids_cpu[i].tolist()
+                try:
+                    eos_pos = target_ids.index(eos_id) if eos_id >= 0 else len(target_ids)
+                except ValueError:
+                    eos_pos = len(target_ids)
+                pred_ids = preds_cpu[i][:eos_pos].tolist()
+                pred_word = tokenizer.decode(pred_ids).strip().lower()
+                if pred_word == target_word.strip().lower():
+                    word_correct += 1
+                word_total += 1
 
-            # Decode predictions
-            for i, pred in enumerate(pred_tokens):
-                pred_word = tokenizer.decode(pred.cpu().tolist())
-                target_word = batch["words"][i]
-                all_predictions.append(pred_word.strip())
-                all_targets.append(target_word.strip())
-
-                # Store sample data for visualization
-                path_coords = batch["path_coords"][i].cpu().numpy()
-                all_samples.append((path_coords, target_word.strip(), pred_word.strip()))
-
-            # Update metrics (only on non-padding positions)
-            # Use the masking-aware labels so padding is ignored
-            char_labels = batch["char_labels"]
-            char_accuracy.update(char_logits_subset, char_labels)
-            word_accuracy.update(char_logits_subset, batch["words"])
-
-    # Compute final metrics
-    char_acc = char_accuracy.compute()
-    word_acc = word_accuracy.compute()
-
-    results = {
-        "char_accuracy": char_acc,
-        "word_accuracy": word_acc,
-        "num_samples": len(all_predictions),
-    }
-
-    return results, all_predictions, all_targets, all_samples
+    return MaskedEvalResult(
+        masked_token_accuracy=(masked_correct / masked_total if masked_total else 0.0),
+        masked_token_count=masked_total,
+        word_accuracy=(word_correct / word_total if word_total else 0.0),
+        word_count=word_total,
+    )
 
 
-def visualize_samples(samples, num_samples=20, output_file="eval_samples.png"):
-    """
-    Visualize swipe paths with their predictions.
+def evaluate_length(
+    *,
+    model,
+    processor,
+    dataset_items: list[dict],
+    device: torch.device,
+    batch_size: int,
+) -> LengthEvalResult:
+    preds: list[float] = []
+    targets: list[int] = []
 
-    Args:
-        samples: List of (path_coords, target, prediction) tuples
-        num_samples: Number of samples to visualize
-        output_file: Output file path
-    """
-    num_samples = min(num_samples, len(samples))
-    cols = 5
-    rows = (num_samples + cols - 1) // cols
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(
+            _iter_batches(dataset_items, batch_size),
+            total=(len(dataset_items) + batch_size - 1) // batch_size,
+            desc="Length eval",
+        ):
+            words = [ex["word"] for ex in batch]
+            paths = [ex["data"] for ex in batch]
 
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-    if rows == 1:
-        axes = axes.reshape(1, -1)
+            inputs = processor(path_coords=paths, text=None, return_tensors="pt")
+            inputs = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()
+            }
+            outputs = model(**inputs, return_dict=True)
 
-    fig.suptitle("Swipe Paths and Predictions", fontsize=16, fontweight="bold")
+            length_logits = getattr(outputs, "length_logits", None)
+            if length_logits is None:
+                raise RuntimeError(
+                    "Model did not return `length_logits`; is predict_length disabled?"
+                )
 
-    for idx in range(num_samples):
-        row = idx // cols
-        col = idx % cols
-        ax = axes[row, col]
+            length_pred = length_logits.reshape(-1).detach().cpu().numpy().astype(np.float64)
+            preds.extend(length_pred.tolist())
+            targets.extend([_swipable_length(w) for w in words])
 
-        path_coords, target, prediction = samples[idx]
+    pred_arr = np.array(preds, dtype=np.float64)
+    tgt_arr = np.array(targets, dtype=np.float64)
+    err = pred_arr - tgt_arr
 
-        # Extract x, y coordinates (ignoring padding)
-        # Path coords shape: (max_path_len, 3) where last dim is (x, y, t)
-        x_coords = path_coords[:, 0]
-        y_coords = path_coords[:, 1]
+    mae = float(np.mean(np.abs(err))) if len(err) else 0.0
+    rmse = float(np.sqrt(np.mean(err**2))) if len(err) else 0.0
 
-        # Remove padding (coordinates that are all zeros)
-        mask = (x_coords != 0) | (y_coords != 0)
-        if mask.sum() > 0:
-            x_coords = x_coords[mask]
-            y_coords = y_coords[mask]
+    pred_round = np.round(pred_arr).clip(min=0.0)
+    acc_exact = float(np.mean(pred_round == tgt_arr)) if len(err) else 0.0
+    acc_w1 = float(np.mean(np.abs(pred_round - tgt_arr) <= 1.0)) if len(err) else 0.0
+    acc_w2 = float(np.mean(np.abs(pred_round - tgt_arr) <= 2.0)) if len(err) else 0.0
 
-        # Plot the path
-        if len(x_coords) > 0:
-            ax.plot(x_coords, y_coords, "o-", linewidth=2, markersize=3, color="blue", alpha=0.7)
-            ax.plot(x_coords[0], y_coords[0], "go", markersize=8, label="Start", zorder=10)
-            ax.plot(x_coords[-1], y_coords[-1], "ro", markersize=8, label="End", zorder=10)
-
-        # Formatting
-        ax.set_xlim(-0.05, 1.05)
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_aspect("equal")
-        ax.grid(True, alpha=0.3)
-        ax.invert_yaxis()  # Invert y-axis to match screen coordinates
-
-        # Title with target and prediction
-        correct = "✓" if prediction == target else "✗"
-        color = "green" if prediction == target else "red"
-        ax.set_title(
-            f'{correct} Target: "{target}"\nPred: "{prediction}"', fontsize=9, color=color, pad=10
-        )
-
-        if idx == 0:
-            ax.legend(loc="upper left", fontsize=7)
-
-    # Hide unused subplots
-    for idx in range(num_samples, rows * cols):
-        row = idx // cols
-        col = idx % cols
-        axes[row, col].axis("off")
-
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=150, bbox_inches="tight")
-    print(f"\nVisualization saved to: {output_file}")
-    plt.close()
+    return LengthEvalResult(
+        mae=mae,
+        rmse=rmse,
+        acc_exact_rounded=acc_exact,
+        acc_within_1=acc_w1,
+        acc_within_2=acc_w2,
+        count=len(targets),
+    )
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate swipe keyboard model")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate a SwipeALot HuggingFace checkpoint")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to a HuggingFace checkpoint directory (e.g. .../checkpoint-6000 or .../final)",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="futo-org/swipe.futo.org",
+        help="HuggingFace dataset name (default: futo-org/swipe.futo.org)",
+    )
     parser.add_argument(
         "--split",
         type=str,
         default="test",
-        help="Dataset split to evaluate on (train/validation/test)",
+        help="Dataset split (default: test)",
     )
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for evaluation")
     parser.add_argument(
-        "--num_samples", type=int, default=None, help="Number of samples to evaluate (None = all)"
+        "--n-samples",
+        type=int,
+        default=5000,
+        help="Number of samples (default: 5000)",
     )
-    parser.add_argument("--show_examples", action="store_true", help="Show example predictions")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size (default: 32)")
     parser.add_argument(
-        "--visualize",
+        "--mask-mode",
+        choices=["random", "all", "none"],
+        default="random",
+        help="Text masking mode (default: random)",
+    )
+    parser.add_argument(
+        "--mask-prob",
+        type=float,
+        default=0.3,
+        help="Mask probability when --mask-mode=random (default: 0.3)",
+    )
+    parser.add_argument(
+        "--mask-eos",
         action="store_true",
-        help="Create visualization of swipe paths and predictions",
+        help="Also mask EOS tokens (default: False)",
     )
+    parser.add_argument("--seed", type=int, default=0, help="RNG seed (default: 0)")
     parser.add_argument(
-        "--viz_samples", type=int, default=20, help="Number of samples to visualize"
+        "--skip-length",
+        action="store_true",
+        help="Skip length evaluation (default: False)",
     )
+
     args = parser.parse_args()
 
-    # Load checkpoint
-    print(f"Loading checkpoint from: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    config = checkpoint["config"]
+    ckpt = Path(args.checkpoint)
+    if not ckpt.exists() or not ckpt.is_dir():
+        raise SystemExit(f"Checkpoint directory not found: {ckpt}")
 
-    # Handle both old (TrainingConfig only) and new (full Config) checkpoint formats
-    from swipealot.config import Config, DataConfig, ModelConfig
-
-    if not hasattr(config, "data"):
-        # Old checkpoint format - only has TrainingConfig
-        print("Warning: Old checkpoint format detected (missing data/model config)")
-        print("Using default values for data and model config...")
-
-        # Extract what we can from the model state dict
-        model_state = checkpoint["model_state_dict"]
-
-        # Get vocab size from embedding layer
-        vocab_size = model_state["embeddings.char_embedding.embedding.weight"].shape[0]
-
-        # Infer model architecture from state dict
-        # d_model from path embedding projection output size
-        d_model = model_state["embeddings.path_embedding.projection.weight"].shape[0]
-
-        # n_layers by counting encoder layers
-        n_layers = (
-            max(
-                int(key.split(".")[2])
-                for key in model_state.keys()
-                if key.startswith("encoder.layers.")
-            )
-            + 1
-        )
-
-        # d_ff from first linear layer
-        d_ff = model_state["encoder.layers.0.linear1.weight"].shape[0]
-
-        # n_heads: can't infer directly from state dict, use heuristic based on d_model
-        # Common configs: d_model=256->4 heads, d_model=512->8 heads, d_model=768->12 heads
-        if d_model >= 768:
-            n_heads = 12
-        elif d_model >= 512:
-            n_heads = 8
-        elif d_model >= 256:
-            n_heads = 4
-        else:
-            n_heads = 4
-
-        # max sequence length from positional embedding
-        max_seq_len = model_state["embeddings.positional_embedding.embedding.weight"].shape[0]
-        # max_seq_len = max_path_len + max_char_len + 2 (CLS, SEP)
-        # Common configs: 64+38+2=104, 128+48+2=178
-        if max_seq_len >= 178:
-            max_path_len = 128
-            max_char_len = 48
-        else:
-            max_path_len = 64
-            max_char_len = 38
-
-        print(
-            f"Inferred model architecture: d_model={d_model}, n_layers={n_layers}, "
-            f"n_heads={n_heads}, d_ff={d_ff}, max_path_len={max_path_len}, "
-            f"max_char_len={max_char_len}"
-        )
-
-        # Create configs with inferred architecture
-        model_config = ModelConfig(
-            vocab_size=vocab_size,
-            d_model=d_model,
-            n_layers=n_layers,
-            n_heads=n_heads,
-            d_ff=d_ff,
-            max_path_len=max_path_len,
-            max_char_len=max_char_len,
-        )
-        data_config = DataConfig(max_path_len=max_path_len, max_char_len=max_char_len)
-
-        # Create full config with defaults
-        full_config = Config(model=model_config, data=data_config, training=config)
-        config = full_config
-
-    # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
-    # Build tokenizer
-    print("\nBuilding tokenizer...")
-    sample_dataset = SwipeDataset(
-        split="train",
-        max_path_len=config.data.max_path_len,
-        max_word_len=config.data.max_char_len,
-        dataset_name=config.data.dataset_name,
-        max_samples=10000,
-    )
-    tokenizer = sample_dataset.tokenizer
+    model = AutoModel.from_pretrained(str(ckpt), trust_remote_code=True).to(device)
+    processor = AutoProcessor.from_pretrained(str(ckpt), trust_remote_code=True)
 
-    # Create test dataset
-    print(f"\nLoading {args.split} dataset...")
-    test_dataset = SwipeDataset(
-        split=args.split,
-        max_path_len=config.data.max_path_len,
-        max_word_len=config.data.max_char_len,
-        tokenizer=tokenizer,
-        dataset_name=config.data.dataset_name,
-        max_samples=args.num_samples,
+    dataset = load_dataset(args.dataset, split=f"{args.split}[:{args.n_samples}]")
+    dataset_items = list(dataset)
+
+    masked = evaluate_masked_tokens(
+        model=model,
+        processor=processor,
+        dataset_items=dataset_items,
+        device=device,
+        batch_size=args.batch_size,
+        mask_mode=args.mask_mode,
+        mask_prob=args.mask_prob,
+        mask_eos=args.mask_eos,
+        seed=args.seed,
     )
 
-    # For evaluation, use ValidationCollator which provides deterministic results
-    # (no random masking, evaluates full reconstruction from unmasked input)
-    collator = ValidationCollator(tokenizer=tokenizer)
-
-    test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, collate_fn=collator
+    print("\n" + "=" * 72)
+    print("Masked token evaluation")
+    print("=" * 72)
+    print(
+        f"masked_token_accuracy: {masked.masked_token_accuracy:.4f} (n={masked.masked_token_count})"
     )
+    print(f"word_accuracy:         {masked.word_accuracy:.4f} (n={masked.word_count})")
 
-    # Create model
-    print("\nCreating model...")
-    model = SwipeTransformerModel(config.model)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device)
-
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {num_params:,}")
-
-    # Evaluate
-    print("\nEvaluating...")
-    results, predictions, targets, samples = evaluate_model(model, test_loader, tokenizer, device)
-
-    # Print results
-    print("\n" + "=" * 60)
-    print("EVALUATION RESULTS")
-    print("=" * 60)
-    print(f"Split: {args.split}")
-    print(f"Number of samples: {results['num_samples']}")
-    print(f"Character Accuracy: {results['char_accuracy']:.4f}")
-    print(f"Word Accuracy: {results['word_accuracy']:.4f}")
-    print("=" * 60)
-
-    # Show examples (always show them)
-    print("\nSample Predictions (case-insensitive comparison):")
-    print("-" * 60)
-    num_to_show = min(args.viz_samples if args.visualize else 20, len(predictions))
-    for i in range(num_to_show):
-        # Case-insensitive comparison since model is uncased
-        correct = "✓" if predictions[i].lower() == targets[i].lower() else "✗"
-        print(f"{correct} Target: '{targets[i]}' | Predicted: '{predictions[i]}'")
-
-    # Visualize if requested
-    if args.visualize:
-        print("\nCreating visualization...")
-        visualize_samples(samples, num_samples=args.viz_samples)
+    if not args.skip_length:
+        length = evaluate_length(
+            model=model,
+            processor=processor,
+            dataset_items=dataset_items,
+            device=device,
+            batch_size=args.batch_size,
+        )
+        print("\n" + "=" * 72)
+        print("Length evaluation (regression)")
+        print("=" * 72)
+        print(f"mae:             {length.mae:.4f}")
+        print(f"rmse:            {length.rmse:.4f}")
+        print(f"acc_exact_round: {length.acc_exact_rounded:.4f}")
+        print(f"acc_within_1:    {length.acc_within_1:.4f}")
+        print(f"acc_within_2:    {length.acc_within_2:.4f}")
 
 
 if __name__ == "__main__":

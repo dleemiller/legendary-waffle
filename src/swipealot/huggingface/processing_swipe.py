@@ -1,13 +1,14 @@
 """Processor for handling multimodal swipe inputs (path + text)."""
 
+from __future__ import annotations
+
+from typing import Any
+
 import numpy as np
 import torch
 from transformers import ProcessorMixin
 
-from ..data.preprocessing import (
-    normalize_and_compute_features,
-    sample_path_points_with_features,
-)
+from ..data.preprocessing import preprocess_raw_path_to_features
 
 
 class SwipeProcessor(ProcessorMixin):
@@ -47,22 +48,36 @@ class SwipeProcessor(ProcessorMixin):
 
     def __call__(
         self,
-        path_coords: list[list[list[float]]] | torch.Tensor | np.ndarray | None = None,
+        path_coords: (
+            list[dict[str, float]]
+            | list[list[dict[str, float]]]
+            | list[list[list[float]]]
+            | torch.Tensor
+            | np.ndarray
+            | None
+        ) = None,
         text: str | list[str] | None = None,
         padding: bool | str = True,
         truncation: bool = True,
         max_length: int | None = None,
         return_tensors: str | None = "pt",
-        **kwargs,
+        **kwargs: Any,
     ):
         """
         Process path coordinates and text into model inputs.
 
         Args:
-            path_coords: List of paths (raw {"x", "y", "t"} dicts) or tensor [batch, path_len, path_input_dim].
-                        Raw paths will be preprocessed to compute motion features.
-                        Can be None if only processing text.
-            text: String or list of strings to encode. Can be None if only processing paths.
+            path_coords:
+                Swipe paths in one of the supported formats:
+                - Raw path (single example): list of dicts like `{"x": ..., "y": ..., "t": ...}`
+                - Raw batch: list of raw paths
+                - Numeric arrays/tensors: `[batch, path_len, D]` or `[path_len, D]`
+                If `D==3` and `path_input_dim==6`, raw `(x,y,t)` triples are converted to engineered
+                `(x, y, dx, dy, ds, log_dt)` features and resampled to `max_path_len`.
+                If omitted, the processor emits a zero path with a zero path attention mask.
+            text:
+                String or list of strings to encode.
+                If omitted, the processor emits padded text tokens with a zero text attention mask.
             padding: Whether to pad sequences. Can be True/False or "max_length"
             truncation: Whether to truncate sequences
             max_length: Maximum sequence length for text (overrides max_char_len)
@@ -74,7 +89,7 @@ class SwipeProcessor(ProcessorMixin):
                 - path_coords: [batch, max_path_len, path_input_dim] (if path_coords provided)
                   Default: [batch, max_path_len, 6] for (x, y, dx, dy, ds, log_dt)
                 - input_ids: [batch, max_char_len] (if text provided)
-                - attention_mask: [batch, total_seq_len]
+                - attention_mask: [batch, total_seq_len] (covers `[CLS] + path + [SEP] + text`)
         """
         if path_coords is None and text is None:
             raise ValueError("Must provide either path_coords or text (or both)")
@@ -139,9 +154,10 @@ class SwipeProcessor(ProcessorMixin):
 
                 # Raw single path: [{"x","y","t"}, ...]
                 if isinstance(first_elem, dict) and "x" in first_elem:
-                    features = normalize_and_compute_features(path_coords)
-                    path_feats, mask = sample_path_points_with_features(
-                        features, self.max_path_len, resample_mode=self.path_resample_mode
+                    path_feats, mask = preprocess_raw_path_to_features(
+                        path_coords,
+                        self.max_path_len,
+                        resample_mode=self.path_resample_mode,
                     )
                     if return_tensors == "pt":
                         path_coords = torch.from_numpy(path_feats).float().unsqueeze(0)
@@ -160,9 +176,10 @@ class SwipeProcessor(ProcessorMixin):
                     processed_paths = []
                     path_masks = []
                     for path in path_coords:
-                        features = normalize_and_compute_features(path)
-                        path_feats, mask = sample_path_points_with_features(
-                            features, self.max_path_len, resample_mode=self.path_resample_mode
+                        path_feats, mask = preprocess_raw_path_to_features(
+                            path,
+                            self.max_path_len,
+                            resample_mode=self.path_resample_mode,
                         )
                         processed_paths.append(path_feats)
                         path_masks.append(mask)
@@ -202,9 +219,10 @@ class SwipeProcessor(ProcessorMixin):
                     path_masks = []
                     for path in path_coords.cpu().numpy():
                         raw = [{"x": float(p[0]), "y": float(p[1]), "t": float(p[2])} for p in path]
-                        features = normalize_and_compute_features(raw)
-                        path_feats, mask = sample_path_points_with_features(
-                            features, self.max_path_len, resample_mode=self.path_resample_mode
+                        path_feats, mask = preprocess_raw_path_to_features(
+                            raw,
+                            self.max_path_len,
+                            resample_mode=self.path_resample_mode,
                         )
                         processed_paths.append(path_feats)
                         path_masks.append(mask)
@@ -225,9 +243,10 @@ class SwipeProcessor(ProcessorMixin):
                     path_masks = []
                     for path in path_coords.detach().cpu().numpy():
                         raw = [{"x": float(p[0]), "y": float(p[1]), "t": float(p[2])} for p in path]
-                        features = normalize_and_compute_features(raw)
-                        path_feats, mask = sample_path_points_with_features(
-                            features, self.max_path_len, resample_mode=self.path_resample_mode
+                        path_feats, mask = preprocess_raw_path_to_features(
+                            raw,
+                            self.max_path_len,
+                            resample_mode=self.path_resample_mode,
                         )
                         processed_paths.append(path_feats)
                         path_masks.append(mask)

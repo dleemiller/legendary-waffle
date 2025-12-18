@@ -162,9 +162,7 @@ class SwipeTokenizer(PreTrainedTokenizer):
         push_to_hub=False,
         **kwargs,
     ):
-        """
-        Save the tokenizer to a directory, ensuring auto_map is included.
-        """
+        """Save the tokenizer and write `auto_map` for `AutoTokenizer` loading."""
         # Call parent save_pretrained
         result = super().save_pretrained(
             save_directory,
@@ -182,7 +180,8 @@ class SwipeTokenizer(PreTrainedTokenizer):
             with open(tokenizer_config_path) as f:
                 config = json.load(f)
 
-            config["auto_map"] = {"AutoTokenizer": ["tokenization_swipe.SwipeTokenizer", None]}
+            # Use the single-class form: we only ship a slow tokenizer implementation.
+            config["auto_map"] = {"AutoTokenizer": "tokenization_swipe.SwipeTokenizer"}
 
             with open(tokenizer_config_path, "w") as f:
                 json.dump(config, f, indent=2)

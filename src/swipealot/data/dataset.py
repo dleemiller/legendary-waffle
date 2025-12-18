@@ -9,7 +9,11 @@ import torch
 from datasets import load_dataset
 from torch.utils.data import Dataset
 
-from .preprocessing import normalize_and_compute_features, sample_path_points_with_features
+from .preprocessing import (
+    normalize_and_compute_features,
+    preprocess_raw_path_to_features,
+    sample_path_points_with_features,
+)
 from .tokenizer import CharacterTokenizer
 
 __all__ = [
@@ -67,12 +71,9 @@ class SwipeDataset(Dataset):
         # Process swipe path
         data_points = sample["data"]
 
-        # Normalize and compute motion features (x, y, dx, dy, ds, log_dt)
-        processed_points = normalize_and_compute_features(data_points)
-
-        # Resampling to fixed length with 6D features
-        path_features, path_mask = sample_path_points_with_features(
-            processed_points,
+        # Fast path: preprocess + resample in one pass (vectorized numpy).
+        path_features, path_mask = preprocess_raw_path_to_features(
+            data_points,
             self.max_path_len,
             resample_mode=self.path_resample_mode,
         )

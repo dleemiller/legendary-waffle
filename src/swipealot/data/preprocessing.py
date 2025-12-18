@@ -7,6 +7,93 @@ used by both the training dataset and the HuggingFace processor.
 import numpy as np
 
 
+def preprocess_raw_path_to_features(
+    data_points: list[dict],
+    max_len: int,
+    *,
+    resample_mode: str = "spatial",
+    dt_clamp_min_ms: float = 1.0,
+    dt_clamp_max_ms: float = 200.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert a raw `{"x","y","t"}` path to fixed-length engineered features.
+
+    This is the fast path used by training and the HuggingFace processor. It avoids
+    building an intermediate list-of-dicts representation by:
+    1) extracting x/y/t arrays once,
+    2) resampling x/y using spatial- or time-uniform interpolation,
+    3) recomputing dx/dy/ds and log_dt on the resampled trajectory.
+
+    Args:
+        data_points: Raw path as a list of dicts with keys: "x", "y", "t".
+        max_len: Target length.
+        resample_mode: "spatial" (arc-length) or "time" (cumulative dt).
+        dt_clamp_min_ms: Clamp for dt feature after resampling (first dt remains 0).
+        dt_clamp_max_ms: Clamp for dt feature after resampling.
+
+    Returns:
+        (features, mask) where:
+          - features: [max_len, 6] float32 array (x, y, dx, dy, ds, log_dt)
+          - mask: [max_len] int64 array (1 for valid; all-ones for non-empty paths)
+    """
+    num_points = len(data_points)
+    if num_points == 0:
+        return (
+            np.zeros((max_len, 6), dtype=np.float32),
+            np.zeros(max_len, dtype=np.int64),
+        )
+
+    x = np.fromiter((p["x"] for p in data_points), dtype=np.float64, count=num_points)
+    y = np.fromiter((p["y"] for p in data_points), dtype=np.float64, count=num_points)
+    t = np.fromiter((p["t"] for p in data_points), dtype=np.float64, count=num_points)
+
+    x = np.clip(x, 0.0, 1.0)
+    y = np.clip(y, 0.0, 1.0)
+
+    # Per-step deltas and axes for resampling
+    dx_in = np.concatenate([[0.0], np.diff(x)])
+    dy_in = np.concatenate([[0.0], np.diff(y)])
+    ds_in = np.hypot(dx_in, dy_in)
+    dt_raw_in = np.concatenate([[0.0], np.diff(t)])
+
+    s = np.cumsum(ds_in)
+    tau = np.cumsum(dt_raw_in)
+
+    if resample_mode not in {"spatial", "time"}:
+        raise ValueError(f"Unknown resample_mode={resample_mode!r} (use 'spatial' or 'time')")
+
+    eps = 1e-12
+    if resample_mode == "time" and tau[-1] > eps:
+        target_tau = np.linspace(0.0, float(tau[-1]), max_len, dtype=np.float64)
+        x_r = np.interp(target_tau, tau, x)
+        y_r = np.interp(target_tau, tau, y)
+        tau_r = target_tau
+    else:
+        # Spatial sampling (or fallback when time axis is degenerate).
+        if s[-1] <= eps:
+            original = np.arange(num_points, dtype=np.float64)
+            target = np.linspace(0, num_points - 1, max_len, dtype=np.float64)
+            x_r = np.interp(target, original, x)
+            y_r = np.interp(target, original, y)
+            tau_r = np.interp(target, original, tau)
+        else:
+            target_s = np.linspace(0.0, float(s[-1]), max_len, dtype=np.float64)
+            x_r = np.interp(target_s, s, x)
+            y_r = np.interp(target_s, s, y)
+            tau_r = np.interp(target_s, s, tau)
+
+    dx = np.concatenate([[0.0], np.diff(x_r)])
+    dy = np.concatenate([[0.0], np.diff(y_r)])
+    ds = np.hypot(dx, dy)
+    dt_raw_r = np.concatenate([[0.0], np.diff(tau_r)])
+    dt_feat = np.clip(dt_raw_r, dt_clamp_min_ms, dt_clamp_max_ms)
+    dt_feat[0] = 0.0
+    log_dt = np.log1p(np.maximum(0.0, dt_feat))
+
+    mask = np.ones(max_len, dtype=np.int64)
+    features = np.stack([x_r, y_r, dx, dy, ds, log_dt], axis=-1).astype(np.float32)
+    return features, mask
+
+
 def normalize_and_compute_features(
     data_points: list[dict],
     dt_clamp_min_ms: float = 1.0,
@@ -36,45 +123,39 @@ def normalize_and_compute_features(
     if not data_points:
         return []
 
-    normalized = []
+    num_points = len(data_points)
+    x = np.fromiter((p["x"] for p in data_points), dtype=np.float64, count=num_points)
+    y = np.fromiter((p["y"] for p in data_points), dtype=np.float64, count=num_points)
+    t = np.fromiter((p["t"] for p in data_points), dtype=np.float64, count=num_points)
 
-    for i, point in enumerate(data_points):
-        # Normalize spatial coordinates to [0, 1]
-        x_norm = max(0.0, min(1.0, point["x"]))
-        y_norm = max(0.0, min(1.0, point["y"]))
+    x = np.clip(x, 0.0, 1.0)
+    y = np.clip(y, 0.0, 1.0)
 
-        # Compute deltas (0 for first point)
-        if i == 0:
-            dx, dy, dt_raw, dt = 0.0, 0.0, 0.0, 0.0
-        else:
-            dx = x_norm - normalized[i - 1]["x"]
-            dy = y_norm - normalized[i - 1]["y"]
-            dt_raw = point["t"] - data_points[i - 1]["t"]
+    dx = np.concatenate([[0.0], np.diff(x)])
+    dy = np.concatenate([[0.0], np.diff(y)])
+    ds = np.hypot(dx, dy)
+    dt_raw = np.concatenate([[0.0], np.diff(t)])
 
-            # Clamp dt to a reasonable range (values are dataset-dependent; profile periodically)
-            dt = max(dt_clamp_min_ms, min(dt_clamp_max_ms, dt_raw))
+    dt = np.clip(dt_raw, dt_clamp_min_ms, dt_clamp_max_ms)
+    dt[0] = 0.0
+    log_dt = np.log1p(np.maximum(0.0, dt))
 
-        # Compute arc length step (spatial distance per step)
-        ds = np.sqrt(dx**2 + dy**2)
-
-        # Log-scale dt for numerical stability
-        log_dt = np.log1p(dt)  # log(1 + dt)
-
-        normalized.append(
+    out: list[dict] = []
+    for i in range(num_points):
+        out.append(
             {
-                "x": x_norm,
-                "y": y_norm,
-                "t": point["t"],
-                "dx": dx,
-                "dy": dy,
-                "ds": ds,
-                "dt_raw": dt_raw,
-                "dt": dt,
-                "log_dt": log_dt,
+                "x": float(x[i]),
+                "y": float(y[i]),
+                "t": float(t[i]),
+                "dx": float(dx[i]),
+                "dy": float(dy[i]),
+                "ds": float(ds[i]),
+                "dt_raw": float(dt_raw[i]),
+                "dt": float(dt[i]),
+                "log_dt": float(log_dt[i]),
             }
         )
-
-    return normalized
+    return out
 
 
 def sample_path_points_with_features(
@@ -119,30 +200,34 @@ def sample_path_points_with_features(
         )
 
     # Extract base signals
-    x = np.asarray([p["x"] for p in data_points], dtype=np.float64)
-    y = np.asarray([p["y"] for p in data_points], dtype=np.float64)
+    x = np.fromiter((p["x"] for p in data_points), dtype=np.float64, count=num_points)
+    y = np.fromiter((p["y"] for p in data_points), dtype=np.float64, count=num_points)
 
     # Prefer provided dx/dy, otherwise derive from x/y
     if all("dx" in p for p in data_points) and all("dy" in p for p in data_points):
-        dx_in = np.asarray([p["dx"] for p in data_points], dtype=np.float64)
-        dy_in = np.asarray([p["dy"] for p in data_points], dtype=np.float64)
+        dx_in = np.fromiter((p["dx"] for p in data_points), dtype=np.float64, count=num_points)
+        dy_in = np.fromiter((p["dy"] for p in data_points), dtype=np.float64, count=num_points)
     else:
         dx_in = np.concatenate([[0.0], np.diff(x)])
         dy_in = np.concatenate([[0.0], np.diff(y)])
 
     # ds can be provided or derived from dx/dy
     if all("ds" in p for p in data_points):
-        ds_in = np.asarray([p["ds"] for p in data_points], dtype=np.float64)
+        ds_in = np.fromiter((p["ds"] for p in data_points), dtype=np.float64, count=num_points)
     else:
         ds_in = np.sqrt(dx_in**2 + dy_in**2)
 
     # Time axis for resampling: prefer dt_raw (unclamped) so "dwell" gets represented.
     if all("dt_raw" in p for p in data_points):
-        dt_axis = np.asarray([p["dt_raw"] for p in data_points], dtype=np.float64)
+        dt_axis = np.fromiter(
+            (p["dt_raw"] for p in data_points), dtype=np.float64, count=num_points
+        )
     elif all("dt" in p for p in data_points):
-        dt_axis = np.asarray([p["dt"] for p in data_points], dtype=np.float64)
+        dt_axis = np.fromiter((p["dt"] for p in data_points), dtype=np.float64, count=num_points)
     elif all("log_dt" in p for p in data_points):
-        log_dt_in_raw = np.asarray([p["log_dt"] for p in data_points], dtype=np.float64)
+        log_dt_in_raw = np.fromiter(
+            (p["log_dt"] for p in data_points), dtype=np.float64, count=num_points
+        )
         dt_axis = np.expm1(log_dt_in_raw)
     else:
         dt_axis = np.zeros(num_points, dtype=np.float64)
