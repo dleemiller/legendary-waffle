@@ -117,7 +117,8 @@ class SwipeTokenizer(PreTrainedTokenizer):
         Returns:
             int: Token ID
         """
-        return self._tokenizer.char_to_id.get(token, self._tokenizer.unk_token_id)
+        # Delegate to the core tokenizer to keep token/id mapping logic in one place.
+        return self._tokenizer.token_to_id(token)
 
     def _convert_id_to_token(self, index: int) -> str:
         """
@@ -180,8 +181,9 @@ class SwipeTokenizer(PreTrainedTokenizer):
             with open(tokenizer_config_path) as f:
                 config = json.load(f)
 
-            # Use the single-class form: we only ship a slow tokenizer implementation.
-            config["auto_map"] = {"AutoTokenizer": "tokenization_swipe.SwipeTokenizer"}
+            # For tokenizers, Transformers expects the 2-tuple form: [slow, fast].
+            # We only ship a slow tokenizer implementation, so fast is None.
+            config["auto_map"] = {"AutoTokenizer": ["tokenization_swipe.SwipeTokenizer", None]}
 
             with open(tokenizer_config_path, "w") as f:
                 json.dump(config, f, indent=2)
