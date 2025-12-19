@@ -129,6 +129,14 @@ class TestTokenizer:
             loaded_tokenizer = SwipeTokenizer.from_pretrained(tmpdir)
             assert loaded_tokenizer.vocab_size == tokenizer.vocab_size
 
+    def test_punctuation_maps_to_punc_token(self):
+        tokenizer = SwipeTokenizer()
+        punc_id = tokenizer.convert_tokens_to_ids("[PUNC]")
+        ids = tokenizer.encode("a,a", add_special_tokens=False)
+        a_id = tokenizer.convert_tokens_to_ids("a")
+        assert ids == [a_id, punc_id, a_id]
+        assert tokenizer.decode(ids) == "aa"
+
 
 class TestProcessor:
     """Test processor."""
@@ -153,6 +161,46 @@ class TestProcessor:
         assert inputs["path_coords"].shape[-1] == 6
         # Check attention mask has correct length: [CLS] + path + [SEP] + chars
         assert inputs["attention_mask"].shape[1] == 1 + 32 + 1 + 20
+
+    def test_encode_helpers(self):
+        tokenizer = SwipeTokenizer()
+        processor = SwipeProcessor(tokenizer=tokenizer, max_path_len=32, max_char_len=20)
+
+        path_coords = [[0.1, 0.2, 0.0], [0.15, 0.25, 0.1]]
+        text = ["hello", "world"]
+
+        path_only = processor.encode_path(path_coords, return_tensors="pt")
+        assert "path_coords" in path_only
+        assert "input_ids" in path_only
+        assert "attention_mask" in path_only
+
+        text_only = processor.encode_text(text, return_tensors="pt")
+        assert "path_coords" in text_only
+        assert "input_ids" in text_only
+        assert "attention_mask" in text_only
+
+        # Attention layout: [CLS:1] + path[max_path_len] + [SEP:1] + text[max_char_len]
+        max_path_len = processor.max_path_len
+        max_char_len = processor.max_char_len
+
+        def _split(attn):
+            cls = attn[:, :1]
+            path = attn[:, 1 : 1 + max_path_len]
+            sep = attn[:, 1 + max_path_len : 1 + max_path_len + 1]
+            txt = attn[:, 1 + max_path_len + 1 : 1 + max_path_len + 1 + max_char_len]
+            return cls, path, sep, txt
+
+        cls, path, sep, txt = _split(path_only["attention_mask"])
+        assert int(cls.sum().item()) == 1
+        assert int(sep.sum().item()) == 1
+        assert int(path.sum().item()) == max_path_len  # resampled -> no padding
+        assert int(txt.sum().item()) == 0  # no text attention
+
+        cls, path, sep, txt = _split(text_only["attention_mask"])
+        assert int(cls.sum().item()) == 2
+        assert int(sep.sum().item()) == 2
+        assert int(path.sum().item()) == 0  # no path attention
+        assert int(txt.sum().item()) > 0  # has text attention
 
     def test_batch_processing(self):
         tokenizer = SwipeTokenizer()

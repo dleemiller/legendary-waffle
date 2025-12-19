@@ -48,16 +48,27 @@ class CharacterTokenizer:
         self.id_to_char = {idx: char for char, idx in self.char_to_id.items()}
         self.vocab_size = len(self.char_to_id)
 
+    def encode_char(self, char: str) -> int:
+        """Encode a single character to a token id (case-insensitive; punctuation -> [PUNC])."""
+        char = char.lower()
+        if char.isalpha() or char.isdigit():
+            return self.char_to_id.get(char, self.unk_token_id)
+        return self.punc_token_id
+
+    def token_to_id(self, token: str) -> int:
+        """Map a token string to its id (supports specials and single characters)."""
+        direct = self.char_to_id.get(token)
+        if direct is not None:
+            return direct
+        if len(token) == 1:
+            return self.encode_char(token)
+        return self.unk_token_id
+
     def encode(self, text: str) -> list[int]:
         """Encode text to token IDs (case-insensitive, punctuation -> [PUNC])."""
-        unk_id = self.char_to_id[self.unk_token]
-        punc_id = self.char_to_id[self.punc_token]
         tokens = []
         for char in text.lower():
-            if char.isalpha() or char.isdigit():
-                tokens.append(self.char_to_id.get(char, unk_id))
-            else:
-                tokens.append(punc_id)
+            tokens.append(self.encode_char(char))
         return tokens
 
     def decode(self, token_ids: list[int]) -> str:

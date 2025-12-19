@@ -403,6 +403,14 @@ class SwipeProcessor(ProcessorMixin):
         """
         return self.tokenizer.decode(token_ids, **kwargs)
 
+    def encode_path(self, path_coords, *, return_tensors: str | None = "pt", **kwargs: Any):
+        """Create model inputs from a swipe path only (no text)."""
+        return self(path_coords=path_coords, text=None, return_tensors=return_tensors, **kwargs)
+
+    def encode_text(self, text, *, return_tensors: str | None = "pt", **kwargs: Any):
+        """Create model inputs from text only (no path)."""
+        return self(path_coords=None, text=text, return_tensors=return_tensors, **kwargs)
+
     # Preprocessing methods are now imported from shared preprocessing module
     # See src/swipealot/data/preprocessing.py for the implementation
 
