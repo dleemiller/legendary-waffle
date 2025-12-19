@@ -10,7 +10,6 @@ so evaluation reflects how the model will be used after export.
 from __future__ import annotations
 
 import argparse
-import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -916,18 +915,17 @@ def main() -> None:
 
     # Configure HF caches before importing transformers (affects dynamic module cache path).
     hf_home = args.hf_home
-    if hf_home is None and Path(".hf_home").exists():
-        hf_home = ".hf_home"
-    if hf_home is not None:
-        hf_home_path = Path(hf_home)
-        os.environ["HF_HOME"] = str(hf_home_path)
-        os.environ["HF_DATASETS_CACHE"] = str(hf_home_path / "datasets")
-        os.environ["HF_MODULES_CACHE"] = str(hf_home_path / "modules")
-        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-    if args.offline:
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["HF_DATASETS_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    from swipealot.utils import configure_hf_env
+
+    if hf_home is not None or args.offline:
+        configure_hf_env(
+            hf_home,
+            offline=bool(args.offline),
+            disable_telemetry=hf_home is not None,
+            overwrite=False,
+            set_hub_cache=False,
+        )
 
     from datasets import load_dataset
     from transformers import AutoModel, AutoProcessor
