@@ -102,6 +102,150 @@ class SwipeLoss(nn.Module):
 
         return -(pos_sims - logsumexp).mean()
 
+    @staticmethod
+    def _get_output(outputs: object, key: str) -> torch.Tensor | None:
+        if isinstance(outputs, dict):
+            return outputs.get(key)
+        return getattr(outputs, key, None)
+
+    def _compute_char_loss(
+        self, *, char_logits: torch.Tensor | None, batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        char_labels = batch.get("char_labels")
+        if char_logits is None or char_labels is None:
+            device = batch["path_coords"].device
+            return torch.tensor(0.0, device=device)
+
+        # Support both:
+        # - `char_logits` over the text segment only: [B, char_len, V]
+        # - legacy `char_logits` over the full mixed sequence: [B, seq_len, V]
+        if char_logits.shape[1] == char_labels.shape[1]:
+            char_logits_subset = char_logits
+        else:
+            # Sequence structure: [CLS] + path + [SEP] + chars
+            path_len = batch["path_coords"].shape[1]
+            char_logits_subset = extract_character_logits(
+                char_logits, path_len, char_labels.shape[1]
+            )
+
+        char_logits_flat = char_logits_subset.reshape(-1, char_logits_subset.shape[-1])
+        char_labels_flat = char_labels.reshape(-1)
+
+        # Only keep supervised positions
+        supervised_mask = char_labels_flat != -100
+        if not supervised_mask.any():
+            return torch.tensor(0.0, device=char_logits.device)
+
+        logits_supervised = char_logits_flat[supervised_mask]
+        labels_supervised = char_labels_flat[supervised_mask]
+
+        loss_terms = F.cross_entropy(
+            logits_supervised, labels_supervised, reduction="none", weight=None
+        )
+
+        if self.char_class_weights is not None:
+            loss_terms = loss_terms * self.char_class_weights[labels_supervised]
+
+        if self.focal_gamma > 0.0:
+            pt = torch.exp(-loss_terms)  # loss = -log(pt)
+            focal_weight = (1 - pt) ** self.focal_gamma
+            loss_terms = focal_weight * loss_terms
+
+        return loss_terms.mean()
+
+    def _compute_path_loss(
+        self, *, path_pred: torch.Tensor | None, batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor | None:
+        if path_pred is None or batch.get("path_labels") is None:
+            return None
+
+        path_labels = batch["path_labels"]  # [B, path_len, path_input_dim]
+        path_mask_indices = batch["path_mask_indices"]  # [B, path_len]
+        path_len = path_labels.shape[1]
+
+        # Support both:
+        # - `path_pred` over the path segment only: [B, path_len, D]
+        # - legacy `path_pred` over the full mixed sequence: [B, seq_len, D]
+        if path_pred.shape[1] == path_len:
+            path_pred_subset = path_pred
+        else:
+            path_start = 1  # Skip [CLS]
+            path_end = 1 + path_len
+            path_pred_subset = path_pred[:, path_start:path_end, :]
+
+        if self.path_loss_dims is not None:
+            dims = [int(d) for d in self.path_loss_dims]
+            if len(dims) == 0:
+                raise ValueError("path_loss_dims must be non-empty when provided")
+            max_dim = int(path_labels.shape[-1])
+            if any(d < 0 or d >= max_dim for d in dims):
+                raise ValueError(f"path_loss_dims {dims} out of range for path_input_dim={max_dim}")
+            path_pred_subset = path_pred_subset[..., dims]
+            path_labels = path_labels[..., dims]
+
+        path_loss = self.path_loss_fn(path_pred_subset, path_labels)  # [B, path_len, D]
+        path_mask_expanded = path_mask_indices.unsqueeze(-1).float()  # [B, path_len, 1]
+        path_loss = (path_loss * path_mask_expanded).sum()
+
+        num_masked = path_mask_indices.sum()
+        if num_masked > 0:
+            return path_loss / num_masked
+        return torch.tensor(0.0, device=path_loss.device)
+
+    def _compute_length_loss(
+        self, *, length_pred: torch.Tensor, batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        length_target = batch["length_target"].float()  # [B]
+        supervise_mask = batch["length_supervise_mask"].bool()  # [B]
+        if not supervise_mask.any():
+            return torch.tensor(0.0, device=length_pred.device)
+
+        huber = nn.SmoothL1Loss(reduction="none")
+        length_loss_terms = huber(length_pred, length_target)
+        return length_loss_terms[supervise_mask].mean()
+
+    def _compute_contrastive_loss(
+        self, *, hidden_states: torch.Tensor, batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        pair_ids = batch["pair_ids"]  # [N]
+        gradient_mask = batch.get("gradient_mask")  # [N]
+        path_len = batch["path_coords"].shape[1]
+
+        sep_position = 1 + path_len
+        sep_embeddings = hidden_states[:, sep_position, :]  # [N, d]
+        d = sep_embeddings.size(-1)
+
+        if self.matryoshka_dims is None:
+            dims = [d]
+        else:
+            dims = sorted({int(x) for x in self.matryoshka_dims if 1 <= int(x) <= d})
+            if len(dims) == 0:
+                dims = [d]
+
+        if self.matryoshka_weights is None:
+            weights = [1.0] * len(dims)
+        else:
+            if len(self.matryoshka_weights) != len(dims):
+                raise ValueError("matryoshka_weights must match matryoshka_dims length")
+            weights = [float(w) for w in self.matryoshka_weights]
+
+        per_dim_losses: list[torch.Tensor] = []
+        for dim in dims:
+            emb_d = sep_embeddings[:, :dim]
+            per_dim_losses.append(
+                self._infonce_from_embeddings(
+                    emb=emb_d,
+                    pair_ids=pair_ids,
+                    temperature=self.contrastive_temperature,
+                    gradient_mask=gradient_mask,
+                )
+            )
+
+        wsum = sum(weights)
+        return sum(w * L for w, L in zip(weights, per_dim_losses, strict=False)) / (
+            wsum if wsum > 0 else 1.0
+        )
+
     def forward(
         self, outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
@@ -115,112 +259,17 @@ class SwipeLoss(nn.Module):
         Returns:
             Dictionary of losses
         """
-        losses = {}
+        losses: dict[str, torch.Tensor] = {}
 
-        # Character prediction loss
-        # Handle both dict and dataclass outputs
-        if isinstance(outputs, dict):
-            char_logits = outputs.get("char_logits")  # [batch, full_seq_len, vocab_size] or None
-        else:
-            char_logits = getattr(outputs, "char_logits", None)
-        char_labels = batch.get("char_labels")
-
-        if char_logits is None or char_labels is None:
-            # Skip char loss if head disabled or labels absent
-            device = batch["path_coords"].device
-            char_loss = torch.tensor(0.0, device=device)
-        else:
-            # Support both:
-            # - `char_logits` over the text segment only: [B, char_len, V]
-            # - legacy `char_logits` over the full mixed sequence: [B, seq_len, V]
-            if char_logits.shape[1] == char_labels.shape[1]:
-                char_logits_subset = char_logits
-            else:
-                # Sequence structure: [CLS] + path + [SEP] + chars
-                path_len = batch["path_coords"].shape[1]
-                char_logits_subset = extract_character_logits(
-                    char_logits, path_len, char_labels.shape[1]
-                )
-
-            # Flatten for loss computation
-            char_logits_flat = char_logits_subset.reshape(-1, char_logits_subset.shape[-1])
-            char_labels_flat = char_labels.reshape(-1)
-
-            # Only keep supervised positions
-            mask = char_labels_flat != -100
-            if mask.any():
-                logits_supervised = char_logits_flat[mask]
-                labels_supervised = char_labels_flat[mask]
-
-                # Use F.cross_entropy for cleaner implementation
-                loss_terms = F.cross_entropy(
-                    logits_supervised, labels_supervised, reduction="none", weight=None
-                )
-
-                # Optional class frequency weighting
-                if self.char_class_weights is not None:
-                    loss_terms = loss_terms * self.char_class_weights[labels_supervised]
-
-                # Optional focal modulation (focal loss formulation)
-                if self.focal_gamma > 0.0:
-                    # Compute pt (probability of true class) for focal weighting
-                    pt = torch.exp(-loss_terms)  # Since loss = -log(pt), pt = exp(-loss)
-                    focal_weight = (1 - pt) ** self.focal_gamma
-                    loss_terms = focal_weight * loss_terms
-
-                char_loss = loss_terms.mean()
-            else:
-                char_loss = torch.tensor(0.0, device=char_logits.device)
+        char_logits = self._get_output(outputs, "char_logits")
+        char_loss = self._compute_char_loss(char_logits=char_logits, batch=batch)
         losses["char_loss"] = char_loss
 
-        # Path prediction loss (if enabled)
-        if isinstance(outputs, dict):
-            path_pred = outputs.get("path_logits", outputs.get("path_coords_pred"))
-        else:
-            path_pred = getattr(outputs, "path_logits", getattr(outputs, "path_coords_pred", None))
-
-        if path_pred is not None and batch.get("path_labels") is not None:
-            path_labels = batch["path_labels"]  # [batch, path_len, path_input_dim]
-            path_mask_indices = batch["path_mask_indices"]  # [batch, path_len]
-            path_len = path_labels.shape[1]
-
-            # Support both:
-            # - `path_pred` over the path segment only: [B, path_len, D]
-            # - legacy `path_pred` over the full mixed sequence: [B, seq_len, D]
-            if path_pred.shape[1] == path_len:
-                path_pred_subset = path_pred
-            else:
-                path_start = 1  # Skip [CLS]
-                path_end = 1 + path_len
-                path_pred_subset = path_pred[:, path_start:path_end, :]
-
-            # Optionally compute path loss on a subset of feature dims (e.g. x/y only).
-            if self.path_loss_dims is not None:
-                dims = [int(d) for d in self.path_loss_dims]
-                if len(dims) == 0:
-                    raise ValueError("path_loss_dims must be non-empty when provided")
-                max_dim = int(path_labels.shape[-1])
-                if any(d < 0 or d >= max_dim for d in dims):
-                    raise ValueError(
-                        f"path_loss_dims {dims} out of range for path_input_dim={max_dim}"
-                    )
-                path_pred_subset = path_pred_subset[..., dims]
-                path_labels = path_labels[..., dims]
-
-            # Compute MSE only on masked positions
-            path_loss = self.path_loss_fn(path_pred_subset, path_labels)  # [batch, path_len, D]
-
-            # Apply mask: only compute loss where we actually masked points
-            path_mask_expanded = path_mask_indices.unsqueeze(-1).float()  # [batch, path_len, 1]
-            path_loss = (path_loss * path_mask_expanded).sum()
-
-            # Normalize by number of masked points
-            num_masked = path_mask_indices.sum()
-            if num_masked > 0:
-                path_loss = path_loss / num_masked
-            else:
-                path_loss = torch.tensor(0.0, device=path_loss.device)
-
+        path_pred = self._get_output(outputs, "path_logits")
+        if path_pred is None:
+            path_pred = self._get_output(outputs, "path_coords_pred")
+        path_loss = self._compute_path_loss(path_pred=path_pred, batch=batch)
+        if path_loss is not None:
             losses["path_loss"] = path_loss
 
         # Total loss
@@ -229,85 +278,31 @@ class SwipeLoss(nn.Module):
             total_loss = total_loss + self.path_weight * losses["path_loss"]
 
         # CLS length prediction (optional)
-        has_length_logits = (
-            "length_logits" in outputs
-            if isinstance(outputs, dict)
-            else hasattr(outputs, "length_logits")
-        )
+        has_length_logits = self._get_output(outputs, "length_logits") is not None
         if (
             self.length_weight > 0.0
             and has_length_logits
             and "length_target" in batch
             and "length_supervise_mask" in batch
         ):
-            if isinstance(outputs, dict):
-                length_pred = outputs["length_logits"]  # [batch]
-            else:
-                length_pred = outputs.length_logits  # [batch]
-            length_target = batch["length_target"].float()  # [batch]
-            supervise_mask = batch["length_supervise_mask"].bool()  # [batch]
-            if supervise_mask.any():
-                huber = nn.SmoothL1Loss(reduction="none")
-                length_loss_terms = huber(length_pred, length_target)
-                length_loss = length_loss_terms[supervise_mask].mean()
-            else:
-                length_loss = torch.tensor(0.0, device=length_pred.device)
+            length_pred = self._get_output(outputs, "length_logits")
+            assert length_pred is not None
+            length_loss = self._compute_length_loss(length_pred=length_pred, batch=batch)
             losses["length_loss"] = length_loss
             total_loss = total_loss + self.length_weight * length_loss
 
         # Contrastive (Matryoshka-capable)
         if self.contrastive_weight > 0.0 and "pair_ids" in batch:
             # Use last_hidden_state (always available) instead of hidden_states (only with output_hidden_states=True)
-            if isinstance(outputs, dict):
-                hidden_states = outputs.get(
-                    "last_hidden_state", outputs.get("hidden_states")
-                )  # [N, seq_len, d]
-            else:
-                hidden_states = outputs.last_hidden_state  # [N, seq_len, d]
-            pair_ids = batch["pair_ids"]  # [N]
-            gradient_mask = batch.get("gradient_mask")  # [N]
-            path_len = batch["path_coords"].shape[1]
+            hidden_states = self._get_output(outputs, "last_hidden_state")
+            if hidden_states is None:
+                hidden_states = self._get_output(outputs, "hidden_states")
+            if hidden_states is None:
+                raise ValueError("contrastive loss enabled but model did not return hidden states")
 
-            sep_position = 1 + path_len
-            sep_embeddings = hidden_states[:, sep_position, :]  # [N, d]
-            d = sep_embeddings.size(-1)
-
-            # Decide which dims to use
-            if self.matryoshka_dims is None:
-                dims = [d]  # original behavior
-            else:
-                dims = [int(x) for x in self.matryoshka_dims]
-                # keep valid, unique, sorted, and ensure full dim included if you want
-                dims = sorted({x for x in dims if 1 <= x <= d})
-                if len(dims) == 0:
-                    dims = [d]
-
-            # Weights
-            if self.matryoshka_weights is None:
-                weights = [1.0] * len(dims)
-            else:
-                if len(self.matryoshka_weights) != len(dims):
-                    raise ValueError("matryoshka_weights must match matryoshka_dims length")
-                weights = [float(w) for w in self.matryoshka_weights]
-
-            # Compute per-dim InfoNCE and combine
-            per_dim_losses = []
-            for dim in dims:
-                emb_d = sep_embeddings[:, :dim]
-                per_dim_losses.append(
-                    self._infonce_from_embeddings(
-                        emb=emb_d,
-                        pair_ids=pair_ids,
-                        temperature=self.contrastive_temperature,
-                        gradient_mask=gradient_mask,
-                    )
-                )
-
-            wsum = sum(weights)
-            contrastive_loss = sum(w * L for w, L in zip(weights, per_dim_losses, strict=False)) / (
-                wsum if wsum > 0 else 1.0
+            contrastive_loss = self._compute_contrastive_loss(
+                hidden_states=hidden_states, batch=batch
             )
-
             losses["contrastive_loss"] = contrastive_loss
             total_loss = total_loss + self.contrastive_weight * contrastive_loss
 

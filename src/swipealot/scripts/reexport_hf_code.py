@@ -13,6 +13,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from swipealot.utils import configure_hf_env
+
 
 @dataclass(frozen=True)
 class CheckpointDir:
@@ -61,13 +63,7 @@ def _read_json(path: Path) -> dict:
 
 
 def _set_env(hf_home: Path, offline: bool) -> None:
-    os.environ.setdefault("HF_HOME", str(hf_home))
-    os.environ.setdefault("HF_DATASETS_CACHE", str(hf_home / "datasets"))
-    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-    if offline:
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    configure_hf_env(hf_home, offline=offline, overwrite=False, set_hub_cache=False)
 
 
 def _reexport_one(checkpoint_dir: Path, *, dry_run: bool) -> None:
@@ -132,8 +128,8 @@ def main() -> None:
     parser.add_argument(
         "--hf-home",
         type=str,
-        default=".hf_home",
-        help="HF cache root to use (default: .hf_home)",
+        default=None,
+        help="Optional HF cache root to use (respects default HF env when omitted)",
     )
     parser.add_argument(
         "--offline",
@@ -157,9 +153,14 @@ def main() -> None:
     if not root.exists():
         raise SystemExit(f"--root not found: {root}")
 
-    hf_home = Path(args.hf_home)
-    hf_home.mkdir(parents=True, exist_ok=True)
-    _set_env(hf_home, bool(args.offline))
+    if args.hf_home is not None:
+        hf_home = Path(args.hf_home)
+        hf_home.mkdir(parents=True, exist_ok=True)
+        _set_env(hf_home, bool(args.offline))
+    elif args.offline:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
     ckpts = _find_checkpoint_dirs(root)
     if args.limit and args.limit > 0:

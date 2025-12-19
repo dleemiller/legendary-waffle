@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 from pathlib import Path
 
 import torch
@@ -25,6 +24,7 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoProcessor
 
 from swipealot.analysis.attention_capture import get_all_layer_attentions
+from swipealot.utils import configure_hf_env
 
 
 def _sharpen_distribution(p: torch.Tensor, temperature: float, eps: float = 1e-12) -> torch.Tensor:
@@ -62,17 +62,21 @@ def main() -> None:
     parser.add_argument("--num-samples", type=int, default=50000)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--output-csv", type=str, required=True)
-    parser.add_argument("--hf-home", type=str, default=".hf_cache")
+    parser.add_argument(
+        "--hf-home",
+        type=str,
+        default=None,
+        help="Optional HF cache root (respects default HF env when omitted)",
+    )
     parser.add_argument("--last-k-layers", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--temperatures", type=float, nargs="+", default=[1.0, 0.8, 0.6, 0.4])
     parser.add_argument("--device", type=str, default=None, help="cpu/cuda; default auto")
     args = parser.parse_args()
 
-    hf_home = Path(args.hf_home)
-    hf_home.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("HF_HOME", str(hf_home))
-    os.environ.setdefault("HF_HUB_CACHE", str(hf_home / "hub"))
-    os.environ.setdefault("HF_MODULES_CACHE", str(hf_home / "modules"))
+    if args.hf_home is not None:
+        hf_home = Path(args.hf_home)
+        hf_home.mkdir(parents=True, exist_ok=True)
+        configure_hf_env(hf_home, overwrite=False)
 
     checkpoint = Path(args.checkpoint)
     if not checkpoint.is_dir():

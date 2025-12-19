@@ -3,6 +3,8 @@
 import tempfile
 from pathlib import Path
 
+import numpy as np
+import pytest
 import torch
 
 from src.swipealot.huggingface import (
@@ -141,6 +143,12 @@ class TestTokenizer:
 class TestProcessor:
     """Test processor."""
 
+    def test_requires_path_or_text(self):
+        tokenizer = SwipeTokenizer()
+        processor = SwipeProcessor(tokenizer=tokenizer)
+        with pytest.raises(ValueError):
+            processor(path_coords=None, text=None, return_tensors="pt")
+
     def test_processor_init(self):
         tokenizer = SwipeTokenizer()
         processor = SwipeProcessor(tokenizer=tokenizer)
@@ -216,6 +224,75 @@ class TestProcessor:
 
         assert inputs["path_coords"].shape[0] == 2
         assert inputs["input_ids"].shape[0] == 2
+
+    def test_raw_dict_path_is_converted_and_attended(self):
+        tokenizer = SwipeTokenizer()
+        processor = SwipeProcessor(tokenizer=tokenizer, max_path_len=16, max_char_len=8)
+
+        raw_path = [
+            {"x": 0.10, "y": 0.20, "t": 0.0},
+            {"x": 0.20, "y": 0.30, "t": 10.0},
+        ]
+
+        inputs = processor(path_coords=raw_path, text=None, return_tensors="pt")
+        assert inputs["path_coords"].shape == (1, 16, 6)
+        assert inputs["input_ids"].shape == (1, 8)
+
+        # Path-only: full attention to path segment, none to text segment.
+        char_start = 1 + processor.max_path_len + 1
+        assert int(inputs["attention_mask"][0, 1 : 1 + processor.max_path_len].sum().item()) == 16
+        assert int(inputs["attention_mask"][0, char_start:].sum().item()) == 0
+
+    def test_numpy_xyt_path_is_converted_to_features(self):
+        tokenizer = SwipeTokenizer()
+        processor = SwipeProcessor(tokenizer=tokenizer, max_path_len=16, max_char_len=8)
+
+        path = np.array([[0.10, 0.20, 0.0], [0.20, 0.30, 10.0]], dtype=np.float32)
+        inputs = processor(path_coords=path, text="hi", return_tensors="pt")
+        assert inputs["path_coords"].shape == (1, 16, 6)
+
+    def test_text_truncation_preserves_eos(self):
+        tokenizer = SwipeTokenizer()
+        processor = SwipeProcessor(tokenizer=tokenizer, max_path_len=8, max_char_len=6)
+
+        inputs = processor(path_coords=None, text="abcdefghij", return_tensors="pt")
+        eos_id = int(tokenizer.eos_token_id)
+        assert int(inputs["input_ids"][0, -1].item()) == eos_id
+
+    def test_tensor_path_is_padded_to_max_path_len(self):
+        tokenizer = SwipeTokenizer()
+        processor = SwipeProcessor(
+            tokenizer=tokenizer, max_path_len=32, max_char_len=20, path_input_dim=6
+        )
+
+        path = torch.zeros(1, 10, 6)
+        path[0, :, 0] = 0.25
+        path[0, :, 1] = 0.5
+
+        inputs = processor(path_coords=path, text=None, return_tensors="pt")
+        assert inputs["path_coords"].shape == (1, 32, 6)
+        assert inputs["attention_mask"].shape[1] == 1 + 32 + 1 + 20
+
+    def test_numeric_list_path_with_6d_features_is_padded(self):
+        tokenizer = SwipeTokenizer()
+        processor = SwipeProcessor(
+            tokenizer=tokenizer, max_path_len=32, max_char_len=20, path_input_dim=6
+        )
+
+        path = [[0.1, 0.2, 0.0, 0.0, 0.0, 0.01] for _ in range(10)]
+        inputs = processor(path_coords=path, text=None, return_tensors="pt")
+        assert inputs["path_coords"].shape == (1, 32, 6)
+        assert inputs["attention_mask"].shape[1] == 1 + 32 + 1 + 20
+
+    def test_return_tensors_none_returns_python_lists_for_numeric_path(self):
+        tokenizer = SwipeTokenizer()
+        processor = SwipeProcessor(tokenizer=tokenizer, max_path_len=8, max_char_len=6)
+
+        path_coords = [[0.1, 0.2, 0.0], [0.15, 0.25, 0.1]]
+        inputs = processor(path_coords=path_coords, text="hi", return_tensors=None)
+        assert isinstance(inputs["path_coords"], list)
+        assert isinstance(inputs["input_ids"], list)
+        assert isinstance(inputs["attention_mask"], list)
 
     def test_save_load_processor(self):
         with tempfile.TemporaryDirectory() as tmpdir:
