@@ -259,6 +259,31 @@ class TestProcessor:
         eos_id = int(tokenizer.eos_token_id)
         assert int(inputs["input_ids"][0, -1].item()) == eos_id
 
+    def test_tensor_path_is_padded_to_max_path_len(self):
+        tokenizer = SwipeTokenizer()
+        processor = SwipeProcessor(
+            tokenizer=tokenizer, max_path_len=32, max_char_len=20, path_input_dim=6
+        )
+
+        path = torch.zeros(1, 10, 6)
+        path[0, :, 0] = 0.25
+        path[0, :, 1] = 0.5
+
+        inputs = processor(path_coords=path, text=None, return_tensors="pt")
+        assert inputs["path_coords"].shape == (1, 32, 6)
+        assert inputs["attention_mask"].shape[1] == 1 + 32 + 1 + 20
+
+    def test_numeric_list_path_with_6d_features_is_padded(self):
+        tokenizer = SwipeTokenizer()
+        processor = SwipeProcessor(
+            tokenizer=tokenizer, max_path_len=32, max_char_len=20, path_input_dim=6
+        )
+
+        path = [[0.1, 0.2, 0.0, 0.0, 0.0, 0.01] for _ in range(10)]
+        inputs = processor(path_coords=path, text=None, return_tensors="pt")
+        assert inputs["path_coords"].shape == (1, 32, 6)
+        assert inputs["attention_mask"].shape[1] == 1 + 32 + 1 + 20
+
     def test_return_tensors_none_returns_python_lists_for_numeric_path(self):
         tokenizer = SwipeTokenizer()
         processor = SwipeProcessor(tokenizer=tokenizer, max_path_len=8, max_char_len=6)

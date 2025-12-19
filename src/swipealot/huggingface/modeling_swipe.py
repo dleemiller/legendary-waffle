@@ -142,87 +142,37 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
         # Initialize weights
         self.post_init()
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        path_coords: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        labels: torch.Tensor | dict | None = None,
-        return_dict: bool | None = None,
-        output_hidden_states: bool | None = None,
-        output_attentions: bool | None = None,
-        **kwargs,
-    ):
-        """
-        Forward pass of the model.
-
-        Args:
-            input_ids (torch.Tensor): Character token IDs [batch, char_len]
-            path_coords (torch.Tensor): Path features [batch, path_len, path_input_dim]
-                                       Default: [batch, path_len, 6] for (x, y, dx, dy, ds, log_dt)
-            attention_mask (torch.Tensor, optional): Attention mask [batch, seq_len]
-            labels (torch.Tensor or dict, optional): Labels for loss calculation
-                Can be tensor [batch, char_len] or dict with keys like char_labels, path_labels
-            return_dict (bool, optional): Whether to return ModelOutput object
-            output_hidden_states (bool, optional): Whether to output hidden states
-            output_attentions (bool, optional): Whether to output attention weights
-            **kwargs: Additional arguments (for compatibility)
-
-        Returns:
-            SwipeTransformerOutput or tuple: Model outputs with:
-                - loss: Optional loss value
-                - char_logits: Character prediction logits [batch, char_len, vocab_size] (if enabled)
-                - path_logits: Path prediction logits [batch, path_len, path_input_dim] (if enabled)
-                - length_logits: Length regression output [batch] (if enabled)
-                - last_hidden_state: Hidden states [batch, seq_len, d_model]
-                - pooler_output: SEP token embedding [batch, d_model] for similarity/embedding tasks
-                - hidden_states: Tuple of per-layer hidden states (if output_hidden_states=True)
-                - attentions: Tuple of per-layer attention weights (if output_attentions=True)
-        """
-        # Validate required inputs
-        if input_ids is None or path_coords is None:
-            raise ValueError("Both input_ids and path_coords are required")
-
-        # Extract labels if dict (used by custom trainers)
-        if isinstance(labels, dict):
-            char_labels = labels.get("char_labels")
-            # Can handle other label types in the future (path_labels, etc.)
-        else:
-            char_labels = labels
-
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
-        )
-        output_attentions = (
-            output_attentions if output_attentions is not None else self.config.output_attentions
-        )
-
-        batch_size = path_coords.shape[0]
-        device = path_coords.device
-
-        # Create [CLS] and [SEP] tokens
+    def _make_special_tokens(
+        self, batch_size: int, *, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         cls_token = torch.full(
-            (batch_size, 1), fill_value=self.config.cls_token_id, dtype=torch.long, device=device
+            (batch_size, 1),
+            fill_value=self.config.cls_token_id,
+            dtype=torch.long,
+            device=device,
         )
         sep_token = torch.full(
-            (batch_size, 1), fill_value=self.config.sep_token_id, dtype=torch.long, device=device
+            (batch_size, 1),
+            fill_value=self.config.sep_token_id,
+            dtype=torch.long,
+            device=device,
         )
+        return cls_token, sep_token
 
-        # Get embeddings
-        embeddings = self.embeddings(path_coords, input_ids, cls_token, sep_token)
+    def _src_key_padding_mask(self, attention_mask: torch.Tensor | None) -> torch.Tensor | None:
+        if attention_mask is None:
+            return None
+        return attention_mask == 0
 
-        # Prepare attention mask for encoder
-        if attention_mask is not None:
-            # Convert attention mask: 1 = attend, 0 = ignore
-            # PyTorch expects: False = attend, True = ignore
-            src_key_padding_mask = attention_mask == 0
-        else:
-            src_key_padding_mask = None
-
-        # Encode while optionally capturing attentions and per-layer hidden states.
+    def _encode(
+        self,
+        embeddings: torch.Tensor,
+        *,
+        src_key_padding_mask: torch.Tensor | None,
+        output_hidden_states: bool,
+        output_attentions: bool,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None, tuple[torch.Tensor, ...] | None]:
+        """Run encoder with optional per-layer hidden-state + attention capture."""
         attentions: tuple[torch.Tensor, ...] | None = None
         hidden_states_by_layer: list[torch.Tensor] | None = [] if output_hidden_states else None
 
@@ -296,64 +246,148 @@ class SwipeTransformerModel(SwipeTransformerPreTrainedModel):
                 if idx in original_forwards:
                     layer.self_attn.forward = original_forwards[idx]
 
-        path_len = path_coords.shape[1]
-        char_len = input_ids.shape[1]
+        all_hidden_states = None
+        if hidden_states_by_layer is not None:
+            all_hidden_states = (embeddings,) + tuple(hidden_states_by_layer)
 
-        # Character prediction (text segment only)
+        return hidden_states, all_hidden_states, attentions
+
+    def _heads(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        path_len: int,
+        char_len: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
         char_logits = None
         if self.char_head is not None:
-            # Sequence is: [CLS] + path + [SEP] + chars
             char_start = 1 + path_len + 1
             char_hidden = hidden_states[:, char_start : char_start + char_len, :]
             char_logits = self.char_head(char_hidden)
 
-        # Path prediction (path segment only, if enabled)
         path_logits = None
         if self.path_head is not None:
             path_hidden = hidden_states[:, 1 : 1 + path_len, :]
             path_logits = self.path_head(path_hidden)
 
-        # Length prediction from CLS token
-        cls_hidden = hidden_states[:, 0, :]  # [batch, d_model] - CLS at position 0
+        cls_hidden = hidden_states[:, 0, :]
         length_logits = self.length_head(cls_hidden) if self.length_head is not None else None
 
-        # Extract SEP token embedding for pooler output (embeddings/similarity tasks)
-        # SEP is at position 1 + path_len
         sep_position = 1 + path_len
-        pooler_output = hidden_states[:, sep_position, :]  # [batch, d_model]
+        pooler_output = hidden_states[:, sep_position, :]
+        return char_logits, path_logits, length_logits, pooler_output
 
-        # Compute loss if labels provided (masked-only; -100 = ignore)
-        loss = None
-        if char_labels is not None and self.char_head is not None:
-            # Predict only the text segment
-            char_pred = char_logits  # [B, char_len, V]
-            labels_flat = char_labels.reshape(-1)
-            mask = labels_flat != -100
-            if mask.any():
-                logits_flat = char_pred.reshape(-1, self.config.vocab_size)[mask]
-                labels_flat = labels_flat[mask]
-                loss = nn.functional.cross_entropy(logits_flat, labels_flat, reduction="mean")
-            else:
-                loss = torch.tensor(0.0, device=hidden_states.device)
+    def _char_loss(
+        self,
+        *,
+        char_logits: torch.Tensor | None,
+        char_labels: torch.Tensor | None,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if char_labels is None or self.char_head is None or char_logits is None:
+            return None
+
+        labels_flat = char_labels.reshape(-1)
+        mask = labels_flat != -100
+        if mask.any():
+            logits_flat = char_logits.reshape(-1, self.config.vocab_size)[mask]
+            labels_flat = labels_flat[mask]
+            return nn.functional.cross_entropy(logits_flat, labels_flat, reduction="mean")
+        return torch.tensor(0.0, device=device)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        path_coords: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | dict | None = None,
+        return_dict: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_attentions: bool | None = None,
+        **kwargs,
+    ):
+        """
+        Forward pass of the model.
+
+        Args:
+            input_ids (torch.Tensor): Character token IDs [batch, char_len]
+            path_coords (torch.Tensor): Path features [batch, path_len, path_input_dim]
+                                       Default: [batch, path_len, 6] for (x, y, dx, dy, ds, log_dt)
+            attention_mask (torch.Tensor, optional): Attention mask [batch, seq_len]
+            labels (torch.Tensor or dict, optional): Labels for loss calculation
+                Can be tensor [batch, char_len] or dict with keys like char_labels, path_labels
+            return_dict (bool, optional): Whether to return ModelOutput object
+            output_hidden_states (bool, optional): Whether to output hidden states
+            output_attentions (bool, optional): Whether to output attention weights
+            **kwargs: Additional arguments (for compatibility)
+
+        Returns:
+            SwipeTransformerOutput or tuple: Model outputs with:
+                - loss: Optional loss value
+                - char_logits: Character prediction logits [batch, char_len, vocab_size] (if enabled)
+                - path_logits: Path prediction logits [batch, path_len, path_input_dim] (if enabled)
+                - length_logits: Length regression output [batch] (if enabled)
+                - last_hidden_state: Hidden states [batch, seq_len, d_model]
+                - pooler_output: SEP token embedding [batch, d_model] for similarity/embedding tasks
+                - hidden_states: Tuple of per-layer hidden states (if output_hidden_states=True)
+                - attentions: Tuple of per-layer attention weights (if output_attentions=True)
+        """
+        if input_ids is None or path_coords is None:
+            raise ValueError("Both input_ids and path_coords are required")
+
+        if isinstance(labels, dict):
+            char_labels = labels.get("char_labels")
+        else:
+            char_labels = labels
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        output_attentions = (
+            output_attentions if output_attentions is not None else self.config.output_attentions
+        )
+
+        batch_size = int(path_coords.shape[0])
+        device = path_coords.device
+        cls_token, sep_token = self._make_special_tokens(batch_size, device=device)
+        embeddings = self.embeddings(path_coords, input_ids, cls_token, sep_token)
+
+        src_key_padding_mask = self._src_key_padding_mask(attention_mask)
+        hidden_states, all_hidden_states, attentions = self._encode(
+            embeddings,
+            src_key_padding_mask=src_key_padding_mask,
+            output_hidden_states=bool(output_hidden_states),
+            output_attentions=bool(output_attentions),
+        )
+
+        path_len = int(path_coords.shape[1])
+        char_len = int(input_ids.shape[1])
+        char_logits, path_logits, length_logits, pooler_output = self._heads(
+            hidden_states,
+            path_len=path_len,
+            char_len=char_len,
+        )
+
+        loss = self._char_loss(
+            char_logits=char_logits,
+            char_labels=char_labels,
+            device=hidden_states.device,
+        )
 
         if not return_dict:
-            hidden_tuple = None
-            if hidden_states_by_layer is not None:
-                hidden_tuple = (embeddings,) + tuple(hidden_states_by_layer)
             output = (
                 char_logits,
                 path_logits,
                 length_logits,
                 hidden_states,
                 pooler_output,
-                hidden_tuple,
+                all_hidden_states,
                 attentions,
             )
             return (loss,) + output if loss is not None else output
-
-        all_hidden_states = None
-        if hidden_states_by_layer is not None:
-            all_hidden_states = (embeddings,) + tuple(hidden_states_by_layer)
 
         return SwipeTransformerOutput(
             loss=loss,

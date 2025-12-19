@@ -281,10 +281,31 @@ class SwipeProcessor(ProcessorMixin):
                     np.stack(path_masks)
                 ).long()
 
-            return (
-                path_coords,
-                torch.ones(path_coords.shape[0], self.max_path_len, dtype=torch.long),
+            if int(path_coords.shape[-1]) != int(self.path_input_dim):
+                raise ValueError(
+                    f"Expected path_coords.shape[-1] == path_input_dim ({self.path_input_dim}), "
+                    f"got {int(path_coords.shape[-1])}. If your path is (x,y,t), pass D=3."
+                )
+
+            path_tensor = path_coords
+            current_path_len = int(path_tensor.shape[1])
+            if truncation and current_path_len > self.max_path_len:
+                path_tensor = path_tensor[:, : self.max_path_len, :]
+            if padding and current_path_len < self.max_path_len:
+                pad_len = self.max_path_len - current_path_len
+                pad_shape = (int(path_tensor.shape[0]), pad_len, int(path_tensor.shape[-1]))
+                pad = torch.zeros(pad_shape, dtype=path_tensor.dtype, device=path_tensor.device)
+                path_tensor = torch.cat([path_tensor, pad], dim=1)
+
+            path_mask = torch.ones(
+                int(path_tensor.shape[0]),
+                int(path_tensor.shape[1]),
+                dtype=torch.long,
+                device=path_tensor.device,
             )
+            is_padding = (path_tensor == 0).all(dim=-1)
+            path_mask[is_padding] = 0
+            return path_tensor, path_mask
 
         # Fallback: treat unknown input as empty path.
         path_coords_out = torch.zeros(batch_size, self.max_path_len, self.path_input_dim)

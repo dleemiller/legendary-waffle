@@ -68,9 +68,13 @@ def evaluate_path_reconstruction_masked_mse(
                 attention_mask=inputs.get("attention_mask"),
                 return_dict=True,
             )
-            recon = outputs.path_recon
+            recon = getattr(outputs, "path_logits", None)
             if recon is None:
-                raise RuntimeError("Model did not return `path_recon`; is predict_path disabled?")
+                recon = getattr(outputs, "path_coords_pred", None)
+            if recon is None:
+                raise RuntimeError(
+                    "Model did not return `path_logits`/`path_coords_pred`; is predict_path disabled?"
+                )
 
             if mse_dims is None:
                 pred = recon[masked]
