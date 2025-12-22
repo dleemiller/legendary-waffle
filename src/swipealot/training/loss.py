@@ -16,6 +16,7 @@ class SwipeLoss(nn.Module):
         path_weight: float = 0.1,
         length_weight: float = 0.0,
         path_loss_dims: list[int] | None = None,
+        path_loss_end_weight: float = 1.0,
         focal_gamma: float = 0.0,
         char_class_weights: torch.Tensor | None = None,
         contrastive_weight: float = 0.0,
@@ -35,6 +36,7 @@ class SwipeLoss(nn.Module):
         self.path_weight = path_weight
         self.length_weight = length_weight
         self.path_loss_dims = path_loss_dims[:] if path_loss_dims is not None else None
+        self.path_loss_end_weight = float(path_loss_end_weight)
         self.focal_gamma = focal_gamma
         self.contrastive_weight = contrastive_weight
         self.contrastive_temperature = contrastive_temperature
@@ -185,11 +187,23 @@ class SwipeLoss(nn.Module):
 
         path_loss = self.path_loss_fn(path_pred_subset, path_labels)  # [B, path_len, D]
         path_mask_expanded = path_mask_indices.unsqueeze(-1).float()  # [B, path_len, 1]
+
+        if self.path_loss_end_weight != 1.0:
+            weights = torch.linspace(
+                1.0,
+                float(self.path_loss_end_weight),
+                path_len,
+                device=path_loss.device,
+                dtype=path_loss.dtype,
+            ).view(1, path_len, 1)
+            path_loss = path_loss * weights
+            path_mask_expanded = path_mask_expanded * weights
+
         path_loss = (path_loss * path_mask_expanded).sum()
 
-        num_masked = path_mask_indices.sum()
-        if num_masked > 0:
-            return path_loss / num_masked
+        denom = path_mask_expanded.sum()
+        if denom > 0:
+            return path_loss / denom
         return torch.tensor(0.0, device=path_loss.device)
 
     def _compute_length_loss(

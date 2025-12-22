@@ -166,6 +166,9 @@ def main():
             inverted_path_prob_heavy=config.training.pairwise_inverted_path_prob_heavy,
             inverted_char_prob_light=config.training.pairwise_inverted_char_prob_light,
             inverted_path_prob_light=config.training.pairwise_inverted_path_prob_light,
+            right_half_prob=config.training.pairwise_right_half_prob,
+            right_half_path_prob=config.training.pairwise_right_half_path_prob,
+            right_half_reverse_prob=config.training.pairwise_right_half_reverse_prob,
         )
         # Use unmasked validation for true accuracy metrics
         val_collator = ValidationCollator(tokenizer=tokenizer)
@@ -230,6 +233,7 @@ def main():
         path_weight=config.training.path_loss_weight,
         length_weight=config.training.length_loss_weight,
         path_loss_dims=config.training.path_loss_dims,
+        path_loss_end_weight=config.training.path_loss_end_weight,
         focal_gamma=config.training.focal_gamma if config.training.use_focal_loss else 0.0,
         char_class_weights=char_freq_weights,
         contrastive_weight=config.training.contrastive_weight,

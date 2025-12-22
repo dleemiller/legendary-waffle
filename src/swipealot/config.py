@@ -69,6 +69,7 @@ class TrainingConfig:
     path_loss_weight: float = 0.1
     length_loss_weight: float = 0.1  # Auxiliary CLS length prediction
     path_loss_dims: list[int] | None = None  # e.g. [0,1] to supervise x/y only
+    path_loss_end_weight: float = 1.0  # Linear ramp weight applied from start->end
 
     # Custom loss settings
     use_focal_loss: bool = False
@@ -86,6 +87,11 @@ class TrainingConfig:
     pairwise_inverted_path_prob_heavy: Any = (0.5, 0.7)
     pairwise_inverted_char_prob_light: Any = (0.1, 0.2)
     pairwise_inverted_path_prob_light: Any = (0.1, 0.2)
+    pairwise_right_half_prob: float = (
+        0.0  # Fraction of non-modality batches using right-half masking
+    )
+    pairwise_right_half_path_prob: Any = (0.6, 0.8)
+    pairwise_right_half_reverse_prob: float = 0.0
     contrastive_weight: float = 0.0
     contrastive_temperature: float = 0.1
 
