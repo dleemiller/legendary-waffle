@@ -7,8 +7,16 @@ import torch
 
 from swipealot.text_utils import swipable_length
 
+from ..masking_policies import (
+    MaskingStats,
+    complement_mask,
+    create_half_mask,
+    create_inverted_masks,
+    create_modality_masks,
+    reverse_char_tokens,
+    reverse_path_coords,
+)
 from ..tokenizer import CharacterTokenizer
-from .utils import mask_contiguous_blocks_1d
 
 
 class PairwiseMaskedCollator:
@@ -57,159 +65,7 @@ class PairwiseMaskedCollator:
         self.right_half_prob = float(right_half_prob)
         self.right_half_path_prob = right_half_path_prob
         self.right_half_reverse_prob = float(right_half_reverse_prob)
-
-    def _create_inverted_masks(
-        self, path_coords, path_mask, char_tokens, char_mask, heavy_aug: bool
-    ):
-        path_len = path_coords.shape[0]
-        char_len = char_tokens.shape[0]
-
-        def _prob_from_cfg(val):
-            if isinstance(val, (tuple, list)):
-                return random.uniform(val[0], val[1])
-            return float(val)
-
-        if heavy_aug:
-            path_mask_prob = _prob_from_cfg(self.pairwise_inverted_path_prob_heavy)
-            text_mask_prob = _prob_from_cfg(self.pairwise_inverted_char_prob_heavy)
-        else:
-            path_mask_prob = _prob_from_cfg(self.pairwise_inverted_path_prob_light)
-            text_mask_prob = _prob_from_cfg(self.pairwise_inverted_char_prob_light)
-
-        path_mask_indices = torch.zeros(path_len, dtype=torch.long)
-        if self.mask_path and path_mask_prob > 0.0:
-            n_valid = int(path_mask.sum().item())
-            n_to_mask = int(round(float(path_mask_prob) * n_valid))
-            if n_to_mask > 0:
-                path_mask_indices = mask_contiguous_blocks_1d(
-                    path_mask,
-                    n_to_mask,
-                    max_block_len=self.path_mask_block_max_len,
-                    rng=random,
-                )
-
-        char_mask_indices = torch.zeros(char_len, dtype=torch.long)
-        for i in range(char_len):
-            if char_mask[i] == 0:
-                continue
-            if random.random() < text_mask_prob:
-                char_mask_indices[i] = 1
-
-        return path_mask_indices, char_mask_indices
-
-    def _create_half_masks(self, path_coords, path_mask, char_tokens, *, side: str, prob):
-        path_len = path_coords.shape[0]
-        char_len = char_tokens.shape[0]
-        half = path_len // 2
-
-        def _prob_from_cfg(val):
-            if isinstance(val, (tuple, list)):
-                return random.uniform(val[0], val[1])
-            return float(val)
-
-        path_mask_indices = torch.zeros(path_len, dtype=torch.long)
-        if self.mask_path:
-            half_mask = path_mask.clone()
-            if side == "right":
-                half_mask[:half] = 0
-            elif side == "left":
-                half_mask[half:] = 0
-            else:
-                raise ValueError(f"Unknown side: {side!r}")
-            n_valid = int(half_mask.sum().item())
-            if n_valid > 0:
-                mask_prob = _prob_from_cfg(prob)
-                n_to_mask = int(round(float(mask_prob) * n_valid))
-                if n_to_mask > 0:
-                    path_mask_indices = mask_contiguous_blocks_1d(
-                        half_mask,
-                        n_to_mask,
-                        max_block_len=self.path_mask_block_max_len,
-                        rng=random,
-                    )
-
-        char_mask_indices = torch.zeros(char_len, dtype=torch.long)
-        return path_mask_indices, char_mask_indices
-
-    def _create_modality_masks(
-        self, path_coords, path_mask, char_tokens, char_mask, mask_path_modality: bool
-    ):
-        path_len = path_coords.shape[0]
-        char_len = char_tokens.shape[0]
-
-        if mask_path_modality:
-            path_mask_indices = (
-                path_mask.clone() if self.mask_path else torch.zeros(path_len, dtype=torch.long)
-            )
-            char_mask_indices = torch.zeros(char_len, dtype=torch.long)
-        else:
-            path_mask_indices = torch.zeros(path_len, dtype=torch.long)
-            char_mask_indices = torch.zeros(char_len, dtype=torch.long)
-            for i in range(char_len):
-                if char_mask[i] == 0:
-                    continue
-                char_mask_indices[i] = 1
-
-        return path_mask_indices, char_mask_indices
-
-    def _reverse_path_coords(
-        self, path_coords: torch.Tensor, path_mask: torch.Tensor
-    ) -> torch.Tensor:
-        valid_len = int(path_mask.sum().item())
-        if valid_len <= 1:
-            return path_coords
-
-        coords = path_coords.clone()
-        segment = coords[:valid_len]
-        dim = int(segment.shape[-1])
-
-        if dim >= 6:
-            x = segment[:, 0].flip(0)
-            y = segment[:, 1].flip(0)
-            dx = torch.zeros_like(x)
-            dy = torch.zeros_like(y)
-            if valid_len > 1:
-                dx[1:] = x[1:] - x[:-1]
-                dy[1:] = y[1:] - y[:-1]
-            ds = torch.hypot(dx, dy)
-
-            log_dt = segment[:, 5]
-            dt = torch.expm1(torch.clamp(log_dt, min=0.0))
-            dt_rev = dt.flip(0)
-            dt_rev[0] = 0.0
-            log_dt_rev = torch.log1p(torch.clamp(dt_rev, min=0.0))
-
-            segment_rev = segment.flip(0)
-            segment_rev = segment_rev.clone()
-            segment_rev[:, 0] = x
-            segment_rev[:, 1] = y
-            segment_rev[:, 2] = dx
-            segment_rev[:, 3] = dy
-            segment_rev[:, 4] = ds
-            segment_rev[:, 5] = log_dt_rev
-            coords[:valid_len] = segment_rev
-            return coords
-
-        coords[:valid_len] = segment.flip(0)
-        return coords
-
-    def _reverse_char_tokens(
-        self, char_tokens: torch.Tensor, char_mask: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        valid_len = int(char_mask.sum().item())
-        if valid_len <= 1:
-            return char_tokens, char_mask
-
-        tokens = char_tokens.clone()
-        valid = tokens[:valid_len]
-        eos_id = self.tokenizer.eos_token_id
-        if int(valid[-1].item()) == int(eos_id) and valid_len > 1:
-            core = valid[:-1].flip(0)
-            new_valid = torch.cat([core, valid[-1:]], dim=0)
-        else:
-            new_valid = valid.flip(0)
-        tokens[:valid_len] = new_valid
-        return tokens, char_mask
+        self.stats = MaskingStats()
 
     def _apply_path_mask(self, path_coords, path_mask_indices):
         masked_coords = path_coords.clone()
@@ -256,11 +112,18 @@ class PairwiseMaskedCollator:
             attn_base = torch.cat([cls_mask, path_mask, sep_mask, char_mask], dim=0)
 
             if use_modality_mode:
-                path_mask_a, char_mask_a = self._create_modality_masks(
-                    path_coords, path_mask, char_tokens, char_mask, mask_path_modality=False
+                mode = "modality"
+                path_mask_a, char_mask_a = create_modality_masks(
+                    path_mask=path_mask,
+                    char_mask=char_mask,
+                    mask_path_modality=False,
+                    mask_path=self.mask_path,
                 )
-                path_mask_b, char_mask_b = self._create_modality_masks(
-                    path_coords, path_mask, char_tokens, char_mask, mask_path_modality=True
+                path_mask_b, char_mask_b = create_modality_masks(
+                    path_mask=path_mask,
+                    char_mask=char_mask,
+                    mask_path_modality=True,
+                    mask_path=self.mask_path,
                 )
                 gradient_a = 1
                 gradient_b = 0
@@ -269,32 +132,57 @@ class PairwiseMaskedCollator:
                     self.right_half_prob > 0.0 and random.random() < self.right_half_prob
                 )
                 if use_right_half:
+                    mode = "right_half"
                     use_reverse = (
                         self.right_half_reverse_prob > 0.0
                         and random.random() < self.right_half_reverse_prob
                     )
                     if use_reverse:
-                        path_coords = self._reverse_path_coords(path_coords, path_mask)
-                        char_tokens, char_mask = self._reverse_char_tokens(char_tokens, char_mask)
-                    path_mask_a, char_mask_a = self._create_half_masks(
-                        path_coords,
-                        path_mask,
-                        char_tokens,
+                        path_coords = reverse_path_coords(path_coords, path_mask)
+                        char_tokens, char_mask = reverse_char_tokens(
+                            char_tokens, char_mask, eos_id=self.tokenizer.eos_token_id
+                        )
+                        mode = "right_half_reversed"
+                    path_mask_a = create_half_mask(
+                        path_mask=path_mask,
                         side="right",
+                        mask_path=self.mask_path,
                         prob=self.right_half_path_prob,
+                        path_mask_block_max_len=self.path_mask_block_max_len,
+                        rng=random,
                     )
-                    if self.mask_path:
-                        path_mask_b = path_mask.clone()
-                        path_mask_b[path_mask_a.bool()] = 0
-                    else:
-                        path_mask_b = torch.zeros_like(path_mask)
+                    char_mask_a = torch.zeros_like(char_mask)
+                    path_mask_b = (
+                        complement_mask(path_mask, path_mask_a)
+                        if self.mask_path
+                        else torch.zeros_like(path_mask)
+                    )
                     char_mask_b = torch.zeros_like(char_mask)
                 else:
-                    path_mask_a, char_mask_a = self._create_inverted_masks(
-                        path_coords, path_mask, char_tokens, char_mask, heavy_aug=True
+                    mode = "inverted"
+                    path_mask_a, char_mask_a = create_inverted_masks(
+                        path_mask=path_mask,
+                        char_mask=char_mask,
+                        heavy=True,
+                        mask_path=self.mask_path,
+                        path_mask_block_max_len=self.path_mask_block_max_len,
+                        inverted_path_prob_heavy=self.pairwise_inverted_path_prob_heavy,
+                        inverted_path_prob_light=self.pairwise_inverted_path_prob_light,
+                        inverted_char_prob_heavy=self.pairwise_inverted_char_prob_heavy,
+                        inverted_char_prob_light=self.pairwise_inverted_char_prob_light,
+                        rng=random,
                     )
-                    path_mask_b, char_mask_b = self._create_inverted_masks(
-                        path_coords, path_mask, char_tokens, char_mask, heavy_aug=False
+                    path_mask_b, char_mask_b = create_inverted_masks(
+                        path_mask=path_mask,
+                        char_mask=char_mask,
+                        heavy=False,
+                        mask_path=self.mask_path,
+                        path_mask_block_max_len=self.path_mask_block_max_len,
+                        inverted_path_prob_heavy=self.pairwise_inverted_path_prob_heavy,
+                        inverted_path_prob_light=self.pairwise_inverted_path_prob_light,
+                        inverted_char_prob_heavy=self.pairwise_inverted_char_prob_heavy,
+                        inverted_char_prob_light=self.pairwise_inverted_char_prob_light,
+                        rng=random,
                     )
                 gradient_a = 1
                 gradient_b = 0
@@ -332,6 +220,13 @@ class PairwiseMaskedCollator:
             gradient_mask.append(gradient_a)
             length_targets.append(swipable_length(item["word"], max_len=char_tokens.shape[0]))
             length_supervise_mask.append(length_supervise)
+            self.stats.update(
+                mode=mode,
+                path_mask_indices=path_mask_a,
+                path_mask=path_mask,
+                char_mask_indices=char_mask_a,
+                char_mask=char_mask,
+            )
 
             masked_path_b = self._apply_path_mask(path_coords, path_mask_b)
             masked_char_b, labels_b = self._apply_char_mask(char_tokens, char_mask_b)
@@ -359,6 +254,13 @@ class PairwiseMaskedCollator:
             gradient_mask.append(gradient_b)
             length_targets.append(swipable_length(item["word"], max_len=char_tokens.shape[0]))
             length_supervise_mask.append(0)
+            self.stats.update(
+                mode=f"{mode}_b",
+                path_mask_indices=path_mask_indices_b,
+                path_mask=path_mask_view_b,
+                char_mask_indices=char_mask_b,
+                char_mask=char_mask,
+            )
 
         result = {
             "path_coords": torch.stack(views_paths),

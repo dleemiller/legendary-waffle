@@ -17,6 +17,7 @@ class SwipeLoss(nn.Module):
         length_weight: float = 0.0,
         path_loss_dims: list[int] | None = None,
         path_loss_end_weight: float = 1.0,
+        path_loss_radial_weight: float = 0.0,
         focal_gamma: float = 0.0,
         char_class_weights: torch.Tensor | None = None,
         contrastive_weight: float = 0.0,
@@ -37,6 +38,7 @@ class SwipeLoss(nn.Module):
         self.length_weight = length_weight
         self.path_loss_dims = path_loss_dims[:] if path_loss_dims is not None else None
         self.path_loss_end_weight = float(path_loss_end_weight)
+        self.path_loss_radial_weight = float(path_loss_radial_weight)
         self.focal_gamma = focal_gamma
         self.contrastive_weight = contrastive_weight
         self.contrastive_temperature = contrastive_temperature
@@ -164,6 +166,7 @@ class SwipeLoss(nn.Module):
         path_labels = batch["path_labels"]  # [B, path_len, path_input_dim]
         path_mask_indices = batch["path_mask_indices"]  # [B, path_len]
         path_len = path_labels.shape[1]
+        path_labels_full = path_labels
 
         # Support both:
         # - `path_pred` over the path segment only: [B, path_len, D]
@@ -186,7 +189,7 @@ class SwipeLoss(nn.Module):
             path_labels = path_labels[..., dims]
 
         path_loss = self.path_loss_fn(path_pred_subset, path_labels)  # [B, path_len, D]
-        path_mask_expanded = path_mask_indices.unsqueeze(-1).float()  # [B, path_len, 1]
+        weight = path_mask_indices.unsqueeze(-1).float()  # [B, path_len, 1]
 
         if self.path_loss_end_weight != 1.0:
             weights = torch.linspace(
@@ -196,12 +199,26 @@ class SwipeLoss(nn.Module):
                 device=path_loss.device,
                 dtype=path_loss.dtype,
             ).view(1, path_len, 1)
-            path_loss = path_loss * weights
-            path_mask_expanded = path_mask_expanded * weights
+            weight = weight * weights
 
-        path_loss = (path_loss * path_mask_expanded).sum()
+        if self.path_loss_radial_weight != 0.0:
+            if int(path_labels_full.shape[-1]) < 2:
+                raise ValueError("path_loss_radial_weight requires x/y dims in path_labels")
+            center_x, center_y = 0.5, 0.5
+            dx = path_labels_full[..., 0] - center_x
+            dy = path_labels_full[..., 1] - center_y
+            dist = torch.sqrt(dx * dx + dy * dy)
+            max_dx = max(center_x, 1.0 - center_x)
+            max_dy = max(center_y, 1.0 - center_y)
+            max_dist = (max_dx * max_dx + max_dy * max_dy) ** 0.5
+            if max_dist > 0:
+                dist = dist / max_dist
+            radial_weight = (1.0 + self.path_loss_radial_weight * dist).unsqueeze(-1)
+            weight = weight * radial_weight
 
-        denom = path_mask_expanded.sum()
+        path_loss = (path_loss * weight).sum()
+
+        denom = weight.sum()
         if denom > 0:
             return path_loss / denom
         return torch.tensor(0.0, device=path_loss.device)

@@ -234,6 +234,7 @@ def main():
         length_weight=config.training.length_loss_weight,
         path_loss_dims=config.training.path_loss_dims,
         path_loss_end_weight=config.training.path_loss_end_weight,
+        path_loss_radial_weight=config.training.path_loss_radial_weight,
         focal_gamma=config.training.focal_gamma if config.training.use_focal_loss else 0.0,
         char_class_weights=char_freq_weights,
         contrastive_weight=config.training.contrastive_weight,

@@ -70,6 +70,7 @@ class TrainingConfig:
     length_loss_weight: float = 0.1  # Auxiliary CLS length prediction
     path_loss_dims: list[int] | None = None  # e.g. [0,1] to supervise x/y only
     path_loss_end_weight: float = 1.0  # Linear ramp weight applied from start->end
+    path_loss_radial_weight: float = 0.0  # Extra weight for points farther from center
 
     # Custom loss settings
     use_focal_loss: bool = False

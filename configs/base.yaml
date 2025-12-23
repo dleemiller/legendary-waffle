@@ -33,6 +33,7 @@ training:
   length_loss_weight: 0.2
   path_loss_dims: [0, 1]  # supervise x/y only (ignore dx/dy/ds/log_dt in path loss)
   path_loss_end_weight: 3.0
+  path_loss_radial_weight: 0.5
   contrastive_weight: 0.1
   use_focal_loss: true
   focal_gamma: 2.0
@@ -46,7 +47,7 @@ training:
   pairwise_inverted_path_prob_heavy: [0.5, 0.7]
   pairwise_inverted_char_prob_light: [0.1, 0.2]
   pairwise_inverted_path_prob_light: [0.1, 0.2]
-  pairwise_right_half_prob: 0.5
+  pairwise_right_half_prob: 0.6
   pairwise_right_half_path_prob: [0.6, 0.8]
   pairwise_right_half_reverse_prob: 0.5
   contrastive_temperature: 0.07
